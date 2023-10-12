@@ -1,8 +1,7 @@
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use mail_parser::MessageParser;
-use rs_smtp::{conn::Conn, sasl};
-use rs_smtp::backend::{Backend, MailOptions, Session};
+use rust_smtp_server::backend::{Backend, MailOptions, Session};
 use tokio::io::{self, AsyncRead, AsyncReadExt};
 use tracing::{debug, trace, instrument};
 
@@ -23,17 +22,17 @@ impl SmtpSession {
 impl Backend for SmtpBackend {
     type S = SmtpSession;
 
-    fn new_session(&self, _c: &mut Conn<Self>) -> Result<SmtpSession> {
+    fn new_session(&self) -> Result<SmtpSession> {
         Ok(SmtpSession::new())
     }
 }
 
 #[async_trait]
 impl Session for SmtpSession {
-    #[instrument(skip(self))]
-    fn authenticators(&mut self) -> Vec<Box<dyn sasl::Server>> {
-        vec!()
-    }
+    // #[instrument(skip(self))]
+    // fn authenticators(&mut self) -> Vec<Box<dyn sasl::Server>> {
+    //     vec!()
+    // }
 
     #[instrument(skip(_opts))]
     async fn mail(&mut self, from: &str, _opts: &MailOptions) -> Result<()> {
@@ -61,6 +60,7 @@ impl Session for SmtpSession {
         let mut reader = io::BufReader::new(r);
 
         while reader.read_to_end(&mut data).await? > 0 {
+            data.push(b'\n');
         }
 
         let message = self

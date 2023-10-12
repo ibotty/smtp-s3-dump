@@ -1,7 +1,7 @@
 use std::{sync::Arc, time::Duration};
 
 use anyhow::Result;
-use rs_smtp::server::Server;
+use rust_smtp_server::server::Server;
 use rustls::server::ServerConfig;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio_rustls::TlsAcceptor;
