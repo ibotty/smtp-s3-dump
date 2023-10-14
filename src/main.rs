@@ -3,9 +3,6 @@ use std::{sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
 use rust_smtp_server::server::Server;
-use tokio_rustls::rustls::{self, Certificate};
-use tokio::fs::File;
-use tokio::io::AsyncReadExt; // for read_to_end()
 use tokio::signal::unix::{signal, SignalKind};
 use tokio_rustls::TlsAcceptor;
 use tracing::info;
@@ -14,6 +11,7 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 mod s3;
 mod smtp;
+mod tls;
 
 #[tokio::main]
 #[instrument]
@@ -34,7 +32,7 @@ async fn main() -> Result<()> {
     let key_path = env::var("SMTP_KEY_FILE");
 
     let tls_acceptor = if let (Ok(cert), Ok(key)) = (cert_path, key_path) {
-        let tls_config = safe_tls_config(&cert, &key).await?;
+        let tls_config = tls::safe_tls_config(&cert, &key).await?;
         Some(TlsAcceptor::from(Arc::new(tls_config)))
     } else {
         None
@@ -88,20 +86,4 @@ async fn main() -> Result<()> {
     tracing::info!("shutting down");
 
     Ok(())
-}
-
-#[instrument]
-async fn safe_tls_config(cert_path: &str, key_path: &str) -> Result<rustls::ServerConfig> {
-    let mut cert_file = File::open(cert_path).await?;
-    let mut cert = vec!();
-    cert_file.read_to_end(&mut cert).await?;
-
-    let mut key_file = File::open(key_path).await?;
-    let mut key = vec!();
-    key_file.read_to_end(&mut key).await?;
-
-    Ok(rustls::ServerConfig::builder()
-        .with_safe_defaults()
-        .with_no_client_auth()
-        .with_single_cert(vec!(Certificate(cert)), rustls::PrivateKey(key))?)
 }
