@@ -1439,6 +1439,7 @@ dependencies = [
  "mail-parser",
  "mime_guess",
  "rust-smtp-server",
+ "rustls-pemfile",
  "serde_json",
  "thiserror",
  "tokio",

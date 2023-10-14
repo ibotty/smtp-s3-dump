@@ -16,13 +16,22 @@ pub struct SmtpBackend {
 }
 
 impl SmtpBackend {
-    pub fn new(s3_config: aws_sdk_s3::Config, bucket: &str, allowed_rcpts: Vec<String>, allowed_from: Vec<String>) -> SmtpBackend {
+    pub fn new(
+        s3_config: aws_sdk_s3::Config,
+        bucket: &str,
+        allowed_rcpts: Vec<String>,
+        allowed_from: Vec<String>,
+    ) -> SmtpBackend {
         let bucket = bucket.to_string();
 
-        let config = Arc::new(ArcSwap::from_pointee(Config{s3_config, bucket, allowed_rcpts, allowed_from}));
-        SmtpBackend{config}
+        let config = Arc::new(ArcSwap::from_pointee(Config {
+            s3_config,
+            bucket,
+            allowed_rcpts,
+            allowed_from,
+        }));
+        SmtpBackend { config }
     }
-
 }
 
 #[derive(Clone, Debug)]
@@ -103,11 +112,17 @@ impl Session for SmtpSession {
             .parse(&data)
             .ok_or_else(|| anyhow!("Cannot parse message"))?;
 
-        s3::upload_message(&self.config.s3_config, &self.config.bucket, &from, &rcpt, message)
-            .await
-            .map_err(|e| {
-                error!("upload to s3 bucket failed: {:?}", e);
-                e
-            })
+        s3::upload_message(
+            &self.config.s3_config,
+            &self.config.bucket,
+            &from,
+            &rcpt,
+            message,
+        )
+        .await
+        .map_err(|e| {
+            error!("upload to s3 bucket failed: {:?}", e);
+            e
+        })
     }
 }
