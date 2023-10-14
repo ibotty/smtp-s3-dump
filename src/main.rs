@@ -51,7 +51,7 @@ async fn main() -> Result<()> {
         .force_path_style(true)
         .build();
 
-    let mut server = Server::new(smtp::SmtpBackend { s3_config, bucket });
+    let mut server = Server::new(smtp::SmtpBackend::new(s3_config, &bucket, vec![], vec![]));
     server.tls_acceptor = tls_acceptor;
     server.addr = smtp_bind_addr.clone();
     server.domain = smtp_domain;
