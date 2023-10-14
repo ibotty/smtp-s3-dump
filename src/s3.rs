@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use anyhow::{Context, Result};
 use aws_sdk_s3::primitives::ByteStream;
+use futures::future::try_join_all;
 use mail_parser::{Message, MimeHeaders};
 use tracing::{instrument, trace};
 
@@ -21,34 +22,50 @@ pub async fn upload_message(
 
     let s3_client = aws_sdk_s3::Client::from_conf(s3_config.clone());
 
-    let headers_map: HashMap<&str, &str> = message
-        .headers_raw()
-        .map(|(k, v)| (k, v.trim()))
-        .collect();
+    let mut uploads = message
+        .attachments()
+        .enumerate()
+        .map(|(ix, attachment)| {
+            let attachment_name = attachment
+                .attachment_name()
+                .context("attachment has no name")?;
+            let body = attachment.contents();
+            let path = format!("{}attachments/{:02}-{}", base_path, ix, attachment_name);
+
+            Ok(upload_file(&s3_client, bucket, path, body.to_vec()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let headers_map: HashMap<&str, &str> =
+        message.headers_raw().map(|(k, v)| (k, v.trim())).collect();
     let headers_json = serde_json::to_vec_pretty(&headers_map)?;
     let headers_path = format!("{}headers.json", base_path);
-    upload_file(&s3_client, bucket, &headers_path, headers_json).await?;
+    uploads.push(upload_file(&s3_client, bucket, headers_path, headers_json));
 
     // this selects only the first part
     if let Some(body_text) = message.text_bodies().next() {
         let body_text_path = format!("{}body.txt", base_path);
-        upload_file(&s3_client, bucket, &body_text_path, body_text.contents().to_vec()).await?;
+        uploads.push(upload_file(
+            &s3_client,
+            bucket,
+            body_text_path,
+            body_text.contents().to_vec(),
+        ));
     }
 
     // this selects only the first part
     if let Some(body_html) = message.html_bodies().next() {
         let body_html_path = format!("{}body.html", base_path);
-        upload_file(&s3_client, bucket, &body_html_path, body_html.contents().to_vec()).await?;
+        uploads.push(upload_file(
+            &s3_client,
+            bucket,
+            body_html_path,
+            body_html.contents().to_vec(),
+        ));
     }
 
-    for (ix, attachment) in message.attachments().enumerate() {
-        let attachment_name = attachment
-            .attachment_name()
-            .context("attachment has no name")?;
-        let body = attachment.contents();
-        let path = format!("{}attachments/{:02}-{}", base_path, ix, attachment_name);
-        upload_file(&s3_client, bucket, &path, body.to_vec()).await?;
-    }
+    // run upload futures
+    try_join_all(uploads).await?;
 
     Ok(())
 }
@@ -57,10 +74,10 @@ pub async fn upload_message(
 async fn upload_file(
     s3_client: &aws_sdk_s3::Client,
     bucket: &str,
-    path: &str,
+    path: String,
     body: Vec<u8>,
 ) -> Result<()> {
-    let content_type = mime_guess::from_path(path).first_raw();
+    let content_type = mime_guess::from_path(&path).first_raw();
 
     trace!(
         "uploading file path={} content_type={}",
