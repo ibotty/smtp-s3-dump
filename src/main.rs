@@ -1,13 +1,18 @@
+use std::env;
 use std::{sync::Arc, time::Duration};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rust_smtp_server::server::Server;
-use rustls::server::ServerConfig;
+use rustls::Certificate;
+use tokio::fs::File;
+use tokio::io::AsyncReadExt; // for read_to_end()
 use tokio::signal::unix::{signal, SignalKind};
 use tokio_rustls::TlsAcceptor;
+use tracing::info;
 use tracing::instrument;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
+mod s3;
 mod smtp;
 
 #[tokio::main]
@@ -22,28 +27,35 @@ async fn main() -> Result<()> {
     let smtp_bind_addr = "0.0.0.0:2525".to_string();
     let smtp_max_messages_bytes = 256 * 1024 * 1024;
     let smtp_max_line_length = 10000;
-    let smtp_domain = "smtp-upload.example.com".to_string();
-    let aws_endpoint_url: Option<String> = None;
+    let smtp_domain = env::var("SMTP_DOMAIN").context("env variable SMTP_DOMAIN not set")?;
+    let bucket: String = env::var("BUCKET_NAME").context("env variable BUCKET_NAME not set")?;
+    let aws_endpoint_url: Option<String> = env::var("AWS_ENDPOINT_URL").ok();
+    let cert_path = env::var("SMTP_CERT_FILE");
+    let key_path = env::var("SMTP_KEY_FILE");
 
-    // let tls_config = safe_tls_config().await?;
-    // let tls_acceptor = TlsAcceptor::from(Arc::new(tls_config));
+    let tls_acceptor = if let (Ok(cert), Ok(key)) = (cert_path, key_path) {
+        let tls_config = safe_tls_config(&cert, &key).await?;
+        Some(TlsAcceptor::from(Arc::new(tls_config)))
+    } else {
+        None
+    };
 
     let aws_config = aws_config::from_env();
-
     // remove once https://github.com/awslabs/smithy-rs/issues/2863 lands
     let aws_config = if let Some(endpoint) = aws_endpoint_url {
         aws_config.endpoint_url(endpoint)
     } else {
         aws_config
     };
-
     let aws_config = aws_config.load().await;
 
-    let _s3 = aws_sdk_s3::Client::new(&aws_config);
+    let s3_config = aws_sdk_s3::config::Builder::from(&aws_config)
+        .force_path_style(true)
+        .build();
 
-    let mut server = Server::new(smtp::SmtpBackend {});
-    // server.tls_acceptor = Some(tls_acceptor);
-    server.addr = smtp_bind_addr;
+    let mut server = Server::new(smtp::SmtpBackend { s3_config, bucket });
+    server.tls_acceptor = tls_acceptor;
+    server.addr = smtp_bind_addr.clone();
     server.domain = smtp_domain;
     server.read_timeout = Duration::from_secs(10);
     server.write_timeout = Duration::from_secs(10);
@@ -51,6 +63,7 @@ async fn main() -> Result<()> {
     server.max_message_bytes = smtp_max_messages_bytes;
     server.max_recipients = 5;
 
+    info!("listening on {}", smtp_bind_addr);
     // let smtp_handler = tokio::spawn(start_smtp_handler(&server));
     let smtp_handler = tokio::spawn(server.listen_and_serve());
 
@@ -72,15 +85,23 @@ async fn main() -> Result<()> {
         _ = terminate => {},
         _ = smtp_handler => {},
     }
-    tracing::info!("starting graceful shutdown");
+    tracing::info!("shutting down");
 
     Ok(())
 }
 
 #[instrument]
-async fn safe_tls_config() -> Result<ServerConfig> {
-    Ok(ServerConfig::builder()
+async fn safe_tls_config(cert_path: &str, key_path: &str) -> Result<rustls::ServerConfig> {
+    let mut cert_file = File::open(cert_path).await?;
+    let mut cert = vec!();
+    cert_file.read_to_end(&mut cert).await?;
+
+    let mut key_file = File::open(key_path).await?;
+    let mut key = vec!();
+    key_file.read_to_end(&mut key).await?;
+
+    Ok(rustls::ServerConfig::builder()
         .with_safe_defaults()
         .with_no_client_auth()
-        .with_single_cert(vec![], rustls::PrivateKey(vec![]))?)
+        .with_single_cert(vec!(Certificate(cert)), rustls::PrivateKey(key))?)
 }
