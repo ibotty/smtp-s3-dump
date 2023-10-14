@@ -3,7 +3,7 @@ use std::{sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
 use rust_smtp_server::server::Server;
-use rustls::Certificate;
+use tokio_rustls::rustls::{self, Certificate};
 use tokio::fs::File;
 use tokio::io::AsyncReadExt; // for read_to_end()
 use tokio::signal::unix::{signal, SignalKind};
