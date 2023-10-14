@@ -1,5 +1,5 @@
 use std::env;
-use std::{sync::Arc, time::Duration};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use rust_smtp_server::server::Server;
@@ -9,6 +9,7 @@ use tracing::info;
 use tracing::instrument;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
+mod notify;
 mod s3;
 mod smtp;
 mod tls;
@@ -32,8 +33,13 @@ async fn main() -> Result<()> {
     let key_path = env::var("SMTP_KEY_FILE");
 
     let tls_acceptor = if let (Ok(cert), Ok(key)) = (cert_path, key_path) {
-        let tls_config = tls::safe_tls_config(&cert, &key).await?;
-        Some(TlsAcceptor::from(Arc::new(tls_config)))
+        let resolver = tls::CertificateResolver::new(&cert, &key)?;
+
+        // start certificate change watcher
+        notify::watch_certs(resolver.clone()).await?;
+
+        let tls_config = tls::safe_tls_config(resolver)?;
+        Some(TlsAcceptor::from(tls_config))
     } else {
         None
     };

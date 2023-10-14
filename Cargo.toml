@@ -15,6 +15,8 @@ bytes = "1"
 futures = "0.3.28"
 mail-parser = "0.9.1"
 mime_guess = "2"
+notify = { version = "6.1.1", default-features = false }
+notify-debouncer-mini = { version = "0.4.1", default-features = false }
 # rs-smtp = "1.0.1"
 rust-smtp-server = { path = "../rust-smtp-server" }
 rustls-pemfile = "1.0.3"
