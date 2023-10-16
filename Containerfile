@@ -1,4 +1,4 @@
-FROM registry.access.redhat.com/ubi9-micro
+FROM registry.access.redhat.com/ubi9-minimal
 ARG BINARY=target/release/smtp-s3-dump
 
 LABEL maintainer="Tobias Florek <tob@butter.sh>"
