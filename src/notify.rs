@@ -17,7 +17,7 @@ use crate::tls;
 pub async fn watch_certs(resolver: Arc<tls::CertificateResolver>) -> Result<()> {
     let (mut debouncer, mut rx) = setup_watcher()?;
 
-    let binding = vec![&resolver.cert_path, &resolver.key_path];
+    let binding = [&resolver.cert_path, &resolver.key_path];
     let mut dirs = binding
         .iter()
         .map(|p| Path::new(p).parent().context("path has no parent"))
