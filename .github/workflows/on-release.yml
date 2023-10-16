@@ -1,0 +1,99 @@
+---
+name: Build release
+env:
+  REGISTRY: quay.io/ibotty
+  IMAGE_NAME: smtp-s3-dump
+  ARCHS: amd64
+
+on:
+  push:
+    tags:
+    - "v[0-9]+.[0-9]+.[0-9]+"
+
+jobs:
+  create-release:
+    name: Create release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+    - uses: actions/checkout@v2
+    - name: Create GitHub release
+      run: gh release create $GITHUB_REF_NAME
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build-release:
+    name: Build and publish release
+    needs:
+    - create-release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+    - uses: actions/checkout@v2
+    - uses: actions-rs/toolchain@v1
+      with:
+        profile: minimal
+        toolchain: stable
+        override: true
+
+    - uses: Swatinem/rust-cache@v2
+
+    - name: Build
+      uses: actions-rs/cargo@v1
+      with:
+        command: build
+        args: --release --all-features
+
+    - name: Create tarball
+      run: |
+        set -x
+        outdir="./target"
+        staging="$(basename ${{ github.repository }})-$GITHUB_REF_NAME"
+        staging_archive="$staging.tar.gz"
+        staging_archive_sum="$staging_archive.sha256"
+        mkdir -p "$staging"
+
+        cp README.md LICENSE "$staging"
+        cp "$outdir"/release/smtp-s3-dump "$staging"
+        tar czf "$staging_archive" "$staging"
+        sha256sum "$staging_archive" > "$staging_archive_sum"
+
+        echo "ASSET=$staging_archive" >> $GITHUB_ENV
+        echo "ASSET_SUM=$staging_archive_sum" >> $GITHUB_ENV
+
+    - name: Upload to GitHub release
+      run: gh release upload $GITHUB_REF_NAME ${{ env.ASSET }} ${{ env.ASSET_SUM }}
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Log into registry
+      uses: redhat-actions/podman-login@v1
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ secrets.QUAY_USERNAME }}
+        password: ${{ secrets.QUAY_PASSWORD }}
+
+    - name: Set up qemu for multi-arch
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y qemu-user-static
+      if: ${{ env.ARCHS != 'amd64' }}
+
+    - name: Build container
+      id: build-image
+      uses: redhat-actions/buildah-build@v2
+      with:
+        image: ${{ env.IMAGE_NAME }}
+        tags: "${{ github.ref_name }} latest"
+        archs: ${{ env.ARCHS }}
+        oci: true
+        containerfiles: ./Containerfile
+
+    - name: push to registry
+      uses: redhat-actions/push-to-registry@v2
+      with:
+        image: ${{ steps.build-image.outputs.image }}
+        tags: ${{ steps.build-image.outputs.tags }}
+        registry: ${{ env.REGISTRY }}
