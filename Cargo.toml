@@ -28,3 +28,7 @@ tokio = { version = "1", features = ["tracing", "macros", "rt-multi-thread", "si
 tokio-rustls = "0.24.1"
 tracing = "0.1.37"
 tracing-subscriber = { version = "0.3.17", features = ["env-filter", "std", "registry", "fmt"] }
+
+
+[profile.release]
+strip = true
