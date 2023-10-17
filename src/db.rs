@@ -12,6 +12,7 @@ pub async fn insert_mail(
     headers: Value,
     attachments: Value,
 ) -> Result<()> {
+    trace!("inserting into DB");
     let query = sqlx::query!(
         r#"INSERT INTO data_gateways.smtp_gateway
             (message_id, "to", "from", body_text, body_html, headers, attachments)
