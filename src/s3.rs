@@ -88,6 +88,7 @@ pub async fn upload_message(
     // afterwards, when complete, insert into DB
     db::insert_mail(
         pg_pool,
+        message_id,
         rcpt,
         from,
         body_text

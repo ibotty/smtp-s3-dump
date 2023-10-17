@@ -4,6 +4,7 @@ use sqlx::postgres::PgPool;
 
 pub async fn insert_mail(
     pool: &PgPool,
+    message_id: &str,
     rcpt: &str,
     from: &str,
     body_text: &str,
@@ -13,8 +14,9 @@ pub async fn insert_mail(
 ) -> Result<()> {
     let query = sqlx::query!(
         r#"INSERT INTO data_gateways.smtp_gateway
-            ("to", "from", body_text, body_html, headers, attachments)
-            VALUES ($1, $2, $3, $4, $5, $6);"#,
+            (message_id, "to", "from", body_text, body_html, headers, attachments)
+            VALUES ($1, $2, $3, $4, $5, $6, $7);"#,
+        message_id,
         rcpt,
         from,
         body_text,
