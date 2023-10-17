@@ -3,12 +3,17 @@ use std::collections::HashMap;
 use anyhow::{Context, Result};
 use aws_sdk_s3::primitives::ByteStream;
 use futures::future::try_join_all;
-use mail_parser::{Message, MimeHeaders};
+use mail_parser::{Message, MessagePart, MimeHeaders};
+use serde_json::json;
+use sqlx::PgPool;
 use tracing::{instrument, trace};
 
-#[instrument(skip(s3_config, message), fields(message_id = message.message_id()))]
+use crate::db;
+
+#[instrument(skip(s3_config, message, pg_pool), fields(message_id = message.message_id()))]
 pub async fn upload_message(
     s3_config: &aws_sdk_s3::Config,
+    pg_pool: &PgPool,
     bucket: &str,
     from: &str,
     rcpt: &str,
@@ -22,6 +27,8 @@ pub async fn upload_message(
 
     let s3_client = aws_sdk_s3::Client::from_conf(s3_config.clone());
 
+    // attachments uploads
+    let mut attachments_metadata = vec![];
     let mut uploads = message
         .attachments()
         .enumerate()
@@ -31,6 +38,15 @@ pub async fn upload_message(
                 .context("attachment has no name")?;
             let body = attachment.contents();
             let path = format!("{}attachments/{:02}-{}", base_path, ix, attachment_name);
+
+            let metadata = json!({
+                "index": ix,
+                "filename": attachment_name,
+                "rel_path": path,
+                "content_type": mime_guess::from_path(&path).first_raw(),
+            });
+
+            attachments_metadata.push(metadata);
 
             Ok(upload_file(&s3_client, bucket, path, body.to_vec()))
         })
@@ -43,7 +59,8 @@ pub async fn upload_message(
     uploads.push(upload_file(&s3_client, bucket, headers_path, headers_json));
 
     // this selects only the first part
-    if let Some(body_text) = message.text_bodies().next() {
+    let body_text = message.text_bodies().next();
+    if let Some(body_text) = body_text {
         let body_text_path = format!("{}body.txt", base_path);
         uploads.push(upload_file(
             &s3_client,
@@ -54,7 +71,8 @@ pub async fn upload_message(
     }
 
     // this selects only the first part
-    if let Some(body_html) = message.html_bodies().next() {
+    let body_html = message.html_bodies().next();
+    if let Some(body_html) = body_html {
         let body_html_path = format!("{}body.html", base_path);
         uploads.push(upload_file(
             &s3_client,
@@ -67,6 +85,23 @@ pub async fn upload_message(
     // run upload futures
     try_join_all(uploads).await?;
 
+    // afterwards, when complete, insert into DB
+    db::insert_mail(
+        pg_pool,
+        rcpt,
+        from,
+        body_text
+            .and_then(MessagePart::text_contents)
+            .unwrap_or("")
+            .trim(),
+        body_html
+            .and_then(MessagePart::text_contents)
+            .unwrap_or("")
+            .trim(),
+        serde_json::to_value(headers_map)?,
+        serde_json::to_value(attachments_metadata)?,
+    )
+    .await?;
     Ok(())
 }
 

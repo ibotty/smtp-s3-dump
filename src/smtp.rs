@@ -10,6 +10,7 @@ use mail_parser::MessageParser;
 use rustyknife::rfc5321::{ForwardPath, Param, ReversePath};
 use rustyknife::types::{Domain, DomainPart, Mailbox};
 use smtpbis::{EhloKeywords, Reply};
+use sqlx::PgPool;
 use tokio_rustls::rustls::ServerConfig;
 use tracing::{error, instrument, trace, warn};
 
@@ -23,6 +24,7 @@ impl SmtpBackend {
     #[instrument(skip(s3_config, tls_config))]
     pub fn new(
         s3_config: aws_sdk_s3::Config,
+        pg_pool: PgPool,
         tls_config: Arc<ServerConfig>,
         domain: &str,
         bucket: &str,
@@ -35,6 +37,7 @@ impl SmtpBackend {
 
         let config = Arc::new(ArcSwap::from_pointee(Config {
             s3_config,
+            pg_pool,
             tls_config,
             domain,
             bucket,
@@ -60,6 +63,7 @@ impl SmtpBackend {
 
 pub struct Config {
     pub s3_config: aws_sdk_s3::Config,
+    pub pg_pool: PgPool,
     pub tls_config: Arc<ServerConfig>,
     pub domain: DomainPart,
     pub bucket: String,
@@ -94,6 +98,7 @@ impl SmtpSession {
 
         s3::upload_message(
             &self.config.s3_config,
+            &self.config.pg_pool,
             &self.config.bucket,
             &from,
             &rcpt,

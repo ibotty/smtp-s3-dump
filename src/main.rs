@@ -5,6 +5,7 @@ use std::net::SocketAddr;
 use anyhow::{Context, Result};
 use futures::{FutureExt, TryFutureExt};
 use smtpbis::{smtp_server, LoopExit};
+use sqlx::postgres::PgPoolOptions;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::signal::unix::{signal, SignalKind};
@@ -15,6 +16,7 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 use crate::smtp::{SmtpBackend, SmtpSession};
 
+mod db;
 mod notify;
 mod s3;
 mod smtp;
@@ -37,6 +39,8 @@ async fn main() -> Result<()> {
     let cert_path =
         env::var("SMTP_CERT_FILE").context("env variable SMTP_CERT_FILE not provided")?;
     let key_path = env::var("SMTP_KEY_FILE").context("env variable SMTP_KEY_FILE not provided")?;
+    let database_url =
+        env::var("DATABASE_URL").context("env variable DATABASE_URL not provided")?;
 
     let allowed_rcpts = env::var("ALLOWED_RCPTS")
         .map(|s| s.split(',').map(str::to_string).collect())
@@ -63,8 +67,14 @@ async fn main() -> Result<()> {
         .force_path_style(true)
         .build();
 
+    let pg_pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&database_url)
+        .await?;
+
     let backend = SmtpBackend::new(
         s3_config,
+        pg_pool,
         tls_config,
         &smtp_domain,
         &bucket,
