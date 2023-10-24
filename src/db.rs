@@ -1,7 +1,10 @@
 use anyhow::Result;
 use serde_json::Value;
 use sqlx::postgres::PgPool;
+use tracing::{trace, instrument};
 
+#[allow(clippy::too_many_arguments)]
+#[instrument(skip_all, fields(from, rcpt))]
 pub async fn insert_mail(
     pool: &PgPool,
     message_id: &str,
@@ -28,4 +31,15 @@ pub async fn insert_mail(
 
     let _ = query.execute(pool).await?;
     Ok(())
+}
+
+#[instrument(skip(pool))]
+pub async fn check_address(
+    pool: &PgPool,
+    from: &str,
+    rcpt: &str,
+) -> Result<bool> {
+    let query = sqlx::query!(r#"SELECT is_valid_rcpt($1, $2) AS "b!";"#, from, rcpt);
+    let res = query.fetch_one(pool).await?;
+    Ok(res.b)
 }

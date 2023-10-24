@@ -14,6 +14,7 @@ use sqlx::PgPool;
 use tokio_rustls::rustls::ServerConfig;
 use tracing::{error, instrument, trace, warn};
 
+use crate::db;
 use crate::s3;
 
 pub struct SmtpBackend {
@@ -21,7 +22,8 @@ pub struct SmtpBackend {
 }
 
 impl SmtpBackend {
-    #[instrument(skip(s3_config, tls_config))]
+    #[allow(clippy::too_many_arguments)]
+    #[instrument(skip(s3_config, pg_pool, tls_config))]
     pub fn new(
         s3_config: aws_sdk_s3::Config,
         pg_pool: PgPool,
@@ -30,6 +32,7 @@ impl SmtpBackend {
         bucket: &str,
         allowed_rcpts: Option<HashSet<String>>,
         allowed_froms: Option<HashSet<String>>,
+        check_db: bool,
     ) -> Result<SmtpBackend> {
         let bucket = bucket.to_string();
         let domain: DomainPart = DomainPart::from_smtp(domain.as_bytes())
@@ -43,6 +46,7 @@ impl SmtpBackend {
             bucket,
             allowed_rcpts,
             allowed_froms,
+            check_db,
         }));
         Ok(SmtpBackend { config })
     }
@@ -69,6 +73,7 @@ pub struct Config {
     pub bucket: String,
     pub allowed_rcpts: Option<HashSet<String>>,
     pub allowed_froms: Option<HashSet<String>>,
+    pub check_db: bool,
 }
 
 pub struct SmtpSession {
@@ -112,6 +117,20 @@ impl SmtpSession {
 
         self.reset();
         Ok(())
+    }
+
+    #[instrument(skip_all, fields(addr))]
+    fn check_address(
+        &self,
+        allowed_map: &Option<HashSet<String>>,
+        addr: &str,
+    ) -> bool {
+        if let Some(map) = allowed_map.as_ref() {
+            if map.contains(addr) {
+                return true;
+            }
+        }
+        return false;
     }
 }
 
@@ -166,6 +185,7 @@ impl smtpbis::Handler for SmtpSession {
         trace!("handle RCPT");
         let (mailbox, domain) = rcpt.into_mailbox(&self.config.domain).into_parts();
         let rcpt = format!("{}@{}", mailbox, domain);
+        let from = self.from.as_ref().unwrap();
 
         if self
             .config
@@ -177,15 +197,30 @@ impl smtpbis::Handler for SmtpSession {
             return Some(Reply::new(550, None, "mailbox unavailable"));
         };
 
-        if self
-            .config
-            .allowed_froms
-            .as_ref()
-            .is_some_and(|c| !c.contains(self.from.as_ref().unwrap()))
+        if !self
+            .check_address(
+                &self.config.allowed_froms,
+                from
+            )
         {
             warn!("rejected mail due to FROM address");
             return Some(Reply::new(550, None, "mailbox unavailable"));
         };
+
+        if self.config.check_db {
+            match db::check_address(&self.config.pg_pool, &from, &rcpt).await {
+                Ok(res) => {
+                    if ! res {
+                        warn!("rejected mail due to DB check");
+                        return Some(Reply::new(550, None, "mailbox unavailable"));
+                    }
+                },
+                Err(e) => {
+                    error!("could not handle request: {}", e);
+                    return Some(Reply::new(451, None, "could not handle request"));
+                }
+            }
+        }
 
         self.rcpt = Some(rcpt);
         None

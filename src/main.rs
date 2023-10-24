@@ -48,6 +48,7 @@ async fn main() -> Result<()> {
     let allowed_froms = env::var("ALLOWED_FROMS")
         .map(|s| s.split(',').map(str::to_string).collect())
         .ok();
+    let check_db: bool = env::var("CHECK_ALLOWED_IN_DB").and_then(|s| Ok(s == "true")).unwrap_or(false);
 
     let resolver = tls::CertificateResolver::new(&cert_path, &key_path)?;
     // start certificate change watcher
@@ -80,6 +81,7 @@ async fn main() -> Result<()> {
         &bucket,
         allowed_rcpts,
         allowed_froms,
+        check_db,
     )?;
 
     let server = start_smtp_server(smtp_bind_addr, backend);

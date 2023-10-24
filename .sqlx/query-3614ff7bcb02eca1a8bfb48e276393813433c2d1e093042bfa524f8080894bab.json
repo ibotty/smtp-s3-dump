@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT is_valid_rcpt($1, $2) AS \"b!\";",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "b!",
+        "type_info": "Bool"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "3614ff7bcb02eca1a8bfb48e276393813433c2d1e093042bfa524f8080894bab"
+}
