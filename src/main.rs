@@ -49,7 +49,7 @@ async fn main() -> Result<()> {
         .map(|s| s.split(',').map(str::to_string).collect())
         .ok();
     let check_db: bool = env::var("CHECK_ALLOWED_IN_DB")
-        .and_then(|s| Ok(s == "true"))
+        .map(|s| s == "true")
         .unwrap_or(false);
 
     let resolver = tls::CertificateResolver::new(&cert_path, &key_path)?;

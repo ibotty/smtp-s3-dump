@@ -199,7 +199,7 @@ impl smtpbis::Handler for SmtpSession {
         };
 
         if self.config.check_db {
-            match db::check_address(&self.config.pg_pool, &from, &rcpt).await {
+            match db::check_address(&self.config.pg_pool, from, &rcpt).await {
                 Ok(res) => {
                     if !res {
                         warn!("rejected mail due to DB check");
