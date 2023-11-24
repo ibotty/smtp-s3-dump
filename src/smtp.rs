@@ -48,6 +48,7 @@ impl SmtpBackend {
             allowed_froms,
             check_db,
         }));
+        trace!("got config");
         Ok(SmtpBackend { config })
     }
 
@@ -126,11 +127,10 @@ impl SmtpSession {
         addr: &str,
     ) -> bool {
         if let Some(map) = allowed_map.as_ref() {
-            if map.contains(addr) {
-                return true;
-            }
+            return map.contains(addr)
         }
-        return false;
+
+        return true;
     }
 }
 

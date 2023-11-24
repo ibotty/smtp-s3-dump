@@ -39,7 +39,9 @@ pub async fn check_address(
     from: &str,
     rcpt: &str,
 ) -> Result<bool> {
-    let query = sqlx::query!(r#"SELECT is_valid_rcpt($1, $2) AS "b!";"#, from, rcpt);
+    trace!("checking DB");
+    let query = sqlx::query!(r#"SELECT is_valid_rcpt($1, $2) AS "b!";"#, rcpt, from);
     let res = query.fetch_one(pool).await?;
+    trace!("checked DB, got {}", res.b);
     Ok(res.b)
 }
