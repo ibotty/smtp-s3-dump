@@ -121,13 +121,9 @@ impl SmtpSession {
     }
 
     #[instrument(skip_all, fields(addr))]
-    fn check_address(
-        &self,
-        allowed_map: &Option<HashSet<String>>,
-        addr: &str,
-    ) -> bool {
+    fn check_address(&self, allowed_map: &Option<HashSet<String>>, addr: &str) -> bool {
         if let Some(map) = allowed_map.as_ref() {
-            return map.contains(addr)
+            return map.contains(addr);
         }
 
         return true;
@@ -197,12 +193,7 @@ impl smtpbis::Handler for SmtpSession {
             return Some(Reply::new(550, None, "mailbox unavailable"));
         };
 
-        if !self
-            .check_address(
-                &self.config.allowed_froms,
-                from
-            )
-        {
+        if !self.check_address(&self.config.allowed_froms, from) {
             warn!("rejected mail due to FROM address");
             return Some(Reply::new(550, None, "mailbox unavailable"));
         };
@@ -210,11 +201,11 @@ impl smtpbis::Handler for SmtpSession {
         if self.config.check_db {
             match db::check_address(&self.config.pg_pool, &from, &rcpt).await {
                 Ok(res) => {
-                    if ! res {
+                    if !res {
                         warn!("rejected mail due to DB check");
                         return Some(Reply::new(550, None, "mailbox unavailable"));
                     }
-                },
+                }
                 Err(e) => {
                     error!("could not handle request: {}", e);
                     return Some(Reply::new(451, None, "could not handle request"));
