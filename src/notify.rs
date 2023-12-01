@@ -9,7 +9,7 @@ use notify_debouncer_mini::{
     notify::{RecommendedWatcher, RecursiveMode},
     DebounceEventResult, Debouncer,
 };
-use tracing::{error, instrument, trace};
+use tracing::{error, instrument, trace, info};
 
 use crate::tls;
 
@@ -35,6 +35,10 @@ pub async fn watch_certs(resolver: Arc<tls::CertificateResolver>) -> Result<()> 
             match res {
                 Ok(event) => {
                     trace!("got inotify event {:?}", event);
+                    match resolver.refresh().await {
+                        Ok(s) => info!("refreshed certificates successfully. {:?}", s),
+                        Err(e) => error!("could not refresh certificates: {:?}", e),
+                    };
                 }
                 Err(e) => {
                     error!("inotify error: {:?}", e);
