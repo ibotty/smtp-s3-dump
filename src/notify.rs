@@ -9,7 +9,7 @@ use notify_debouncer_mini::{
     notify::{RecommendedWatcher, RecursiveMode},
     DebounceEventResult, Debouncer,
 };
-use tracing::{error, instrument, trace, info};
+use tracing::{error, info, instrument, trace};
 
 use crate::tls;
 
