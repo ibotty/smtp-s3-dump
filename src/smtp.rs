@@ -12,7 +12,7 @@ use rustyknife::types::{Domain, DomainPart, Mailbox};
 use smtpbis::{EhloKeywords, Reply};
 use sqlx::PgPool;
 use tokio_rustls::rustls::ServerConfig;
-use tracing::{error, instrument, trace, warn};
+use tracing::{debug, error, instrument, warn};
 
 use crate::db;
 use crate::s3;
@@ -48,7 +48,7 @@ impl SmtpBackend {
             allowed_froms,
             check_db,
         }));
-        trace!("got config");
+        debug!("got config");
         Ok(SmtpBackend { config })
     }
 
@@ -88,7 +88,7 @@ pub struct SmtpSession {
 impl SmtpSession {
     #[instrument(skip(self))]
     fn reset(&mut self) {
-        trace!("resetting session");
+        debug!("resetting session");
         self.from = None;
         self.rcpt = None;
         self.data = vec![];
@@ -145,7 +145,7 @@ impl smtpbis::Handler for SmtpSession {
         domain: DomainPart,
         mut initial_keywords: EhloKeywords,
     ) -> Result<(String, EhloKeywords), Reply> {
-        trace!("handle EHLO");
+        debug!("handle EHLO");
         let max_message_size = 100_000_000;
         initial_keywords.insert("DSN".into(), None);
         initial_keywords.insert("8BITMIME".into(), None);
@@ -165,7 +165,7 @@ impl smtpbis::Handler for SmtpSession {
 
     #[instrument(skip_all)]
     async fn mail(&mut self, from: ReversePath, _params: Vec<Param>) -> Option<Reply> {
-        trace!("handle MAIL");
+        debug!("handle MAIL");
 
         if let Some((mailbox, domain)) =
             std::convert::Into::<Option<Mailbox>>::into(from).map(Mailbox::into_parts)
@@ -178,7 +178,7 @@ impl smtpbis::Handler for SmtpSession {
 
     #[instrument(skip_all, fields(from=self.from))]
     async fn rcpt(&mut self, rcpt: ForwardPath, _params: Vec<Param>) -> Option<Reply> {
-        trace!("handle RCPT");
+        debug!("handle RCPT");
         let (mailbox, domain) = rcpt.into_mailbox(&self.config.domain).into_parts();
         let rcpt = format!("{}@{}", mailbox, domain);
         let from = self.from.as_ref().unwrap();
@@ -227,7 +227,7 @@ impl smtpbis::Handler for SmtpSession {
     where
         S: Stream<Item = Result<BytesMut, smtpbis::LineError>> + Unpin + Send,
     {
-        trace!("handle DATA");
+        debug!("handle DATA");
 
         let mut nb_lines: usize = 0;
 

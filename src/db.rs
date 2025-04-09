@@ -1,7 +1,7 @@
 use anyhow::Result;
 use serde_json::Value;
 use sqlx::postgres::PgPool;
-use tracing::{info, instrument, trace};
+use tracing::{debug, info, instrument};
 
 #[allow(clippy::too_many_arguments)]
 #[instrument(skip_all, fields(from, rcpt))]
@@ -15,7 +15,7 @@ pub async fn insert_mail(
     headers: Value,
     attachments: Value,
 ) -> Result<()> {
-    trace!("inserting into DB");
+    debug!("inserting into DB");
     let query = sqlx::query!(
         r#"INSERT INTO data_gateways.smtp_gateway
             (message_id, "to", "from", body_text, body_html, headers, attachments)

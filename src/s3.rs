@@ -6,7 +6,7 @@ use futures::future::try_join_all;
 use mail_parser::{Message, MessagePart, MimeHeaders};
 use serde_json::json;
 use sqlx::PgPool;
-use tracing::{instrument, trace};
+use tracing::{debug, instrument};
 
 use crate::db;
 
@@ -19,7 +19,7 @@ pub async fn upload_message(
     rcpt: &str,
     message: Message<'_>,
 ) -> Result<()> {
-    trace!("uploading message");
+    debug!("uploading message");
 
     let message_id = message.message_id().context("mail has no message id")?;
     let date = message.date().context("mail has no date")?.to_rfc3339();
@@ -115,7 +115,7 @@ async fn upload_file(
 ) -> Result<()> {
     let content_type = mime_guess::from_path(&path).first_raw();
 
-    trace!(
+    debug!(
         "uploading file path={} content_type={}",
         path,
         content_type.unwrap_or("")
