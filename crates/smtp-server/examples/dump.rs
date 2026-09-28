@@ -6,8 +6,7 @@ use std::sync::Arc;
 
 use mail_parser::{MessageParser, MimeHeaders};
 use smtp_server::{
-    Config, Domain, Envelope, ForwardPath, Handler, Hostname, Recipient, Rejection, ReversePath,
-    Sender, TlsMode,
+    Config, Domain, Envelope, ForwardPath, Handler, Hostname, Recipient, Rejection, Sender, TlsMode,
 };
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
@@ -33,10 +32,7 @@ impl Handler for Dump {
     // reply for all recipients: if any store fails, the client retries the whole transaction, so
     // stores must be idempotent (key = hash of message + rcpt).
     async fn data_end(&mut self, env: &Envelope, msg: Vec<u8>) -> Result<String, Rejection> {
-        let from = match env.sender().path() {
-            ReversePath::Null => "<>".to_owned(),
-            ReversePath::Mailbox(m) => m.to_string(),
-        };
+        let from = env.sender().path();
         let id = content_hash(&msg);
         let message = MessageParser::default()
             .parse(&msg)
@@ -57,37 +53,26 @@ impl Handler for Dump {
             .collect();
 
         for rcpt in env.rcpts().iter() {
-            let dir = match rcpt.path() {
-                ForwardPath::Postmaster => "postmaster".to_owned(),
-                ForwardPath::Mailbox(m) => m.to_string(),
-            };
-            let base = format!("{dir}/{id}");
-            tokio::fs::create_dir_all(&base)
-                .await
-                .map_err(|_| Rejection::transient("could not store message"))?;
-            tokio::fs::write(format!("{base}/headers.txt"), &headers)
-                .await
-                .map_err(|_| Rejection::transient("could not store message"))?;
-            if let Some(body) = &text_body {
-                tokio::fs::write(format!("{base}/body.txt"), body)
-                    .await
-                    .map_err(|_| Rejection::transient("could not store message"))?;
-            }
-            if let Some(body) = &html_body {
-                tokio::fs::write(format!("{base}/body.html"), body)
-                    .await
-                    .map_err(|_| Rejection::transient("could not store message"))?;
-            }
-            if !attachments.is_empty() {
-                tokio::fs::create_dir_all(format!("{base}/attachments"))
-                    .await
-                    .map_err(|_| Rejection::transient("could not store message"))?;
-                for (name, contents) in &attachments {
-                    tokio::fs::write(format!("{base}/attachments/{name}"), contents)
-                        .await
-                        .map_err(|_| Rejection::transient("could not store message"))?;
+            let base = format!("{}/{id}", rcpt.path());
+            let stored: io::Result<()> = async {
+                tokio::fs::create_dir_all(&base).await?;
+                tokio::fs::write(format!("{base}/headers.txt"), &headers).await?;
+                if let Some(body) = &text_body {
+                    tokio::fs::write(format!("{base}/body.txt"), body).await?;
                 }
+                if let Some(body) = &html_body {
+                    tokio::fs::write(format!("{base}/body.html"), body).await?;
+                }
+                if !attachments.is_empty() {
+                    tokio::fs::create_dir_all(format!("{base}/attachments")).await?;
+                    for (name, contents) in &attachments {
+                        tokio::fs::write(format!("{base}/attachments/{name}"), contents).await?;
+                    }
+                }
+                Ok(())
             }
+            .await;
+            stored.map_err(|_| Rejection::transient("could not store message"))?;
         }
         Ok(format!(
             "{id}: {} bytes, {} attachment(s) from {from} for {} rcpt(s)",
