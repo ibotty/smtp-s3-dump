@@ -9,6 +9,8 @@ mod types;
 
 #[cfg(feature = "tokio")]
 mod driver;
+#[cfg(feature = "tokio")]
+mod shutdown;
 
 pub use reply::{EnhancedCode, InvalidRejection, RejectCode, Rejection};
 pub use session::{
@@ -24,6 +26,8 @@ pub use types::{
 
 #[cfg(feature = "tokio")]
 pub use driver::{Handler, serve, serve_tls, serve_tls_until, serve_until};
+#[cfg(feature = "tokio")]
+pub use shutdown::{Shutdown, ShutdownTrigger, shutdown_signal};
 
 use std::num::NonZeroU32;
 use std::time::Duration;

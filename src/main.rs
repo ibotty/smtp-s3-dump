@@ -2,14 +2,14 @@ use std::env;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use smtp_server::{shutdown_signal, Shutdown};
 use sqlx::postgres::PgPoolOptions;
 use tokio::net::TcpListener;
-use tokio::signal::unix::{signal, SignalKind};
+use tokio::signal::unix::{signal, Signal, SignalKind};
+use tokio::task::JoinSet;
 use tokio_rustls::TlsAcceptor;
-use tokio_util::sync::CancellationToken;
-use tokio_util::task::TaskTracker;
 use tracing::instrument;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
@@ -22,7 +22,9 @@ mod s3;
 mod smtp;
 mod tls;
 
-const SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
+/// How long in-flight sessions get to finish on shutdown; keep below the orchestrator's
+/// kill timeout (Kubernetes `terminationGracePeriodSeconds` defaults to 30s).
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(25);
 
 #[tokio::main]
 #[instrument]
@@ -92,73 +94,91 @@ async fn main() -> Result<()> {
         check_db,
     )?;
 
-    let tracker = TaskTracker::new();
-    let stop = CancellationToken::new();
-    let smtp_handler = tokio::spawn(start_smtp_server(
-        smtp_bind_addr,
-        backend,
-        tracker.clone(),
-        stop.clone(),
-    ));
+    let mut sigint = signal(SignalKind::interrupt()).context("failed to install SIGINT handler")?;
+    let mut sigterm =
+        signal(SignalKind::terminate()).context("failed to install SIGTERM handler")?;
 
-    let ctrl_c = async {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("failed to install Ctrl-C handler")
-    };
-
-    let terminate = async {
-        signal(SignalKind::terminate())
-            .expect("failed to install signal handler")
-            .recv()
-            .await;
-    };
+    let (trigger, stop_rx) = shutdown_signal();
+    let mut server = tokio::spawn(start_smtp_server(smtp_bind_addr, backend, stop_rx));
 
     tokio::select! {
-        _ = ctrl_c => {},
-        _ = terminate => {},
-        _ = smtp_handler => {},
+        _ = next_signal(&mut sigint, &mut sigterm) => {},
+        // the server only ends on its own if it failed (e.g. bind error)
+        res = &mut server => return res.context("smtp server task failed")?,
     }
-    tracing::info!("shutting down");
+    info!(
+        "shutting down, waiting up to {:?} for open sessions",
+        SHUTDOWN_GRACE
+    );
 
-    // stop accepting, then give in-flight sessions a chance to finish
-    stop.cancel();
-    tracker.close();
-    if tokio::time::timeout(SHUTDOWN_GRACE, tracker.wait())
-        .await
-        .is_err()
-    {
-        warn!(
-            "{} connection(s) still open after {:?}, aborting",
-            tracker.len(),
-            SHUTDOWN_GRACE
-        );
+    trigger.trigger();
+    tokio::select! {
+        res = &mut server => res.context("smtp server task failed")??,
+        _ = tokio::time::sleep(SHUTDOWN_GRACE) => warn!("grace period over, aborting open sessions"),
+        _ = next_signal(&mut sigint, &mut sigterm) => warn!("second signal, aborting open sessions"),
     }
+    // dropping the server task's JoinSet aborts whatever is still running
+    server.abort();
 
     Ok(())
+}
+
+async fn next_signal(sigint: &mut Signal, sigterm: &mut Signal) {
+    tokio::select! {
+        _ = sigint.recv() => {},
+        _ = sigterm.recv() => {},
+    }
 }
 
 #[instrument(skip_all)]
 async fn start_smtp_server(
     smtp_bind_addr: String,
     smtp_backend: SmtpBackend,
-    tracker: TaskTracker,
-    stop: CancellationToken,
+    stop: Shutdown,
 ) -> Result<()> {
     info!("listening on {}", smtp_bind_addr);
-    let listener = TcpListener::bind(smtp_bind_addr).await?;
+    let listener = TcpListener::bind(&smtp_bind_addr)
+        .await
+        .with_context(|| format!("cannot listen on {smtp_bind_addr}"))?;
 
-    while let Some(Ok((socket, addr))) = stop.run_until_cancelled(listener.accept()).await {
-        let mut session = smtp_backend.new_session()?;
-        let server_config = smtp_backend.server_config.clone();
-        tracker.spawn(async move {
-            let acceptor = TlsAcceptor::from(session.config.tls_config.clone());
-            if let Err(e) =
-                smtp_server::serve(socket, &mut session, server_config, Some(acceptor)).await
-            {
-                warn!("could not handle connection from {}: {}", addr, e);
+    let mut stopped = stop.clone();
+    let mut sessions = JoinSet::new();
+    loop {
+        tokio::select! {
+            _ = stopped.requested() => break,
+            // reap finished sessions so the set does not grow
+            Some(res) = sessions.join_next() => {
+                if let Err(e) = res {
+                    error!("session task failed: {}", e);
+                }
             }
-        });
+            accepted = listener.accept() => match accepted {
+                Ok((socket, addr)) => {
+                    let mut session = smtp_backend.new_session()?;
+                    let server_config = smtp_backend.server_config.clone();
+                    let stop = stop.clone();
+                    sessions.spawn(async move {
+                        let acceptor = TlsAcceptor::from(session.config.tls_config.clone());
+                        if let Err(e) = smtp_server::serve_until(
+                            socket, &mut session, server_config, Some(acceptor), stop,
+                        )
+                        .await
+                        {
+                            warn!("could not handle connection from {}: {}", addr, e);
+                        }
+                    });
+                }
+                Err(e) => {
+                    // e.g. out of file descriptors: keep serving, don't spin
+                    error!("accept failed: {}", e);
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+        }
     }
+
+    drop(listener);
+    info!("waiting for {} open session(s)", sessions.len());
+    while sessions.join_next().await.is_some() {}
     Ok(())
 }

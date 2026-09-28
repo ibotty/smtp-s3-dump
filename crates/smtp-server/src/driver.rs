@@ -10,11 +10,11 @@ use std::time::Instant;
 use futures_util::FutureExt;
 use futures_util::future::{Either, select};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::watch;
 use tokio_rustls::TlsAcceptor;
 
 use crate::{
-    Cleartext, Config, Envelope, Plain, Poll, Recipient, Rejection, Sender, Session, Tls, Transport,
+    Cleartext, Config, Envelope, Plain, Poll, Recipient, Rejection, Sender, Session, Shutdown, Tls,
+    Transport,
 };
 
 /// Reacts to protocol events. All methods default to accepting; override what you need.
@@ -111,20 +111,20 @@ where
     serve_inner(stream, handler, cfg, tls, None).await
 }
 
-/// Like [`serve`], but stops gracefully once `shutdown` holds `true`.
+/// Like [`serve`], but stops gracefully once `shutdown` is triggered.
 ///
 /// A connection that is idle (waiting for a command) gets `421 4.3.2` and is closed right away.
 /// A message being received (`DATA`/`BDAT` payload) or a running handler is never interrupted:
 /// the transaction finishes and is answered as usual, and the connection is closed with `421`
-/// once the server would wait for the client again. Clone one receiver per connection; the
-/// signal is level-triggered, so connections accepted after it was sent are closed immediately.
-/// Dropping the sender without sending `true` disables shutdown.
+/// once the server would wait for the client again. Clone one [`Shutdown`] per connection; it
+/// is level-triggered, so connections accepted after the trigger are closed immediately.
+/// Dropping the [`crate::ShutdownTrigger`] without triggering disables shutdown.
 pub async fn serve_until<S, H>(
     stream: S,
     handler: &mut H,
     cfg: Arc<Config>,
     tls: Option<TlsAcceptor>,
-    shutdown: watch::Receiver<bool>,
+    shutdown: Shutdown,
 ) -> io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
@@ -138,7 +138,7 @@ async fn serve_inner<S, H>(
     handler: &mut H,
     cfg: Arc<Config>,
     tls: Option<TlsAcceptor>,
-    mut shutdown: Option<watch::Receiver<bool>>,
+    mut shutdown: Option<Shutdown>,
 ) -> io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
@@ -200,7 +200,7 @@ pub async fn serve_tls_until<S, H>(
     handler: &mut H,
     cfg: Arc<Config>,
     tls: TlsAcceptor,
-    shutdown: watch::Receiver<bool>,
+    shutdown: Shutdown,
 ) -> io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
@@ -214,7 +214,7 @@ async fn serve_tls_inner<S, H>(
     handler: &mut H,
     cfg: Arc<Config>,
     tls: TlsAcceptor,
-    mut shutdown: Option<watch::Receiver<bool>>,
+    mut shutdown: Option<Shutdown>,
 ) -> io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
@@ -233,13 +233,11 @@ where
 }
 
 /// Resolves once shutdown was requested; never resolves without a (live) signal.
-async fn shutdown_requested(shutdown: &mut Option<watch::Receiver<bool>>) {
-    if let Some(rx) = shutdown
-        && rx.wait_for(|stop| *stop).await.is_ok()
-    {
-        return;
+async fn shutdown_requested(shutdown: &mut Option<Shutdown>) {
+    match shutdown {
+        Some(s) => s.requested().await,
+        None => pending().await,
     }
-    pending().await
 }
 
 /// Drives `session` to completion; returns `Some(start_tls)` only when the client asked for
@@ -249,7 +247,7 @@ async fn run<S, T, H>(
     mut session: Session<T>,
     h: &mut H,
     cfg: &Config,
-    shutdown: &mut Option<watch::Receiver<bool>>,
+    shutdown: &mut Option<Shutdown>,
 ) -> io::Result<Option<T::StartTls>>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,

@@ -192,14 +192,14 @@ async fn rest(client: &mut tokio::io::DuplexStream) -> String {
 #[tokio::test]
 async fn shutdown_closes_idle_connection_with_421() {
     let (mut client, server) = tokio::io::duplex(4096);
-    let (tx, rx) = tokio::sync::watch::channel(false);
+    let (trigger, rx) = smtp_server::shutdown_signal();
     let mut handler = Echo;
     let task = tokio::spawn(async move {
         smtp_server::serve_until(server, &mut handler, cfg(), None, rx).await
     });
 
     expect(&mut client, b"220").await;
-    tx.send(true).unwrap();
+    trigger.trigger();
     assert!(rest(&mut client).await.starts_with("421 4.3.2"));
     task.await.expect("task panicked").expect("serve failed");
 }
@@ -207,7 +207,7 @@ async fn shutdown_closes_idle_connection_with_421() {
 #[tokio::test]
 async fn shutdown_lets_message_in_flight_finish() {
     let (mut client, server) = tokio::io::duplex(4096);
-    let (tx, rx) = tokio::sync::watch::channel(false);
+    let (trigger, rx) = smtp_server::shutdown_signal();
     let mut handler = Echo;
     let task = tokio::spawn(async move {
         smtp_server::serve_until(server, &mut handler, cfg(), None, rx).await
@@ -224,7 +224,7 @@ async fn shutdown_lets_message_in_flight_finish() {
         expect(&mut client, reply).await;
     }
     client.write_all(b"partial\r\n").await.unwrap();
-    tx.send(true).unwrap();
+    trigger.trigger();
     tokio::time::sleep(Duration::from_millis(100)).await;
     client.write_all(b"hello\r\n.\r\n").await.unwrap();
     let tail = rest(&mut client).await;
@@ -236,8 +236,8 @@ async fn shutdown_lets_message_in_flight_finish() {
 #[tokio::test]
 async fn connection_after_shutdown_gets_421_after_greeting() {
     let (mut client, server) = tokio::io::duplex(4096);
-    let (tx, rx) = tokio::sync::watch::channel(false);
-    tx.send(true).unwrap();
+    let (trigger, rx) = smtp_server::shutdown_signal();
+    trigger.trigger();
     let mut handler = Echo;
     let task = tokio::spawn(async move {
         smtp_server::serve_until(server, &mut handler, cfg(), None, rx).await
@@ -248,5 +248,22 @@ async fn connection_after_shutdown_gets_421_after_greeting() {
         all.starts_with("220") && all.contains("\r\n421 4.3.2"),
         "{all:?}"
     );
+    task.await.expect("task panicked").expect("serve failed");
+}
+
+#[tokio::test]
+async fn dropped_trigger_does_not_shut_down() {
+    let (mut client, server) = tokio::io::duplex(4096);
+    let (trigger, rx) = smtp_server::shutdown_signal();
+    drop(trigger);
+    let mut handler = Echo;
+    let task = tokio::spawn(async move {
+        smtp_server::serve_until(server, &mut handler, cfg(), None, rx).await
+    });
+
+    expect(&mut client, b"220").await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    client.write_all(b"QUIT\r\n").await.unwrap();
+    expect(&mut client, b"221").await;
     task.await.expect("task panicked").expect("serve failed");
 }
