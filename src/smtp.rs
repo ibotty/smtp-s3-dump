@@ -71,6 +71,8 @@ pub struct Config {
     pub domain: Hostname,
     pub bucket: String,
     pub allowed_rcpts: Option<HashSet<String>>,
+    /// Spam filter on the client-asserted `MAIL FROM`; there is no SMTP AUTH, SPF or DKIM, so
+    /// this is not a security boundary.
     pub allowed_froms: Option<HashSet<String>>,
     pub check_db: bool,
 }

@@ -3,6 +3,8 @@ use serde_json::Value;
 use sqlx::postgres::PgPool;
 use tracing::{debug, info, instrument};
 
+/// `from` is the client-asserted `MAIL FROM`: it is not authenticated (no SMTP AUTH, SPF or DKIM),
+/// so consumers of the stored `"from"` column must not trust it.
 #[allow(clippy::too_many_arguments)]
 #[instrument(skip_all, fields(from, rcpt))]
 pub async fn insert_mail(
