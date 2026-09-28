@@ -259,8 +259,9 @@ async fn handler_supplies_greeting_text() {
     assert_eq!(greeting_of(Echo).await, b"220 mx.example.org ESMTP\r\n");
 }
 
-struct Boom {
-    greeting: bool,
+enum Boom {
+    Greeting,
+    Rset,
 }
 
 impl Handler for Boom {
@@ -268,10 +269,10 @@ impl Handler for Boom {
         Ok(String::new())
     }
     async fn greeting(&mut self) -> String {
-        if self.greeting {
-            panic!("boom");
+        match self {
+            Boom::Greeting => panic!("boom"),
+            Boom::Rset => String::new(),
         }
-        String::new()
     }
     async fn rset(&mut self) {
         panic!("boom")
@@ -280,14 +281,14 @@ impl Handler for Boom {
 
 #[tokio::test]
 async fn panicking_greeting_closes_with_421() {
-    let (mut client, task) = spawn(Boom { greeting: true }, cfg(), None);
+    let (mut client, task) = spawn(Boom::Greeting, cfg(), None);
     assert!(rest(&mut client).await.starts_with("421 "));
     join(task).await;
 }
 
 #[tokio::test]
 async fn panicking_rset_closes_with_421() {
-    let (mut client, task) = spawn(Boom { greeting: false }, cfg(), None);
+    let (mut client, task) = spawn(Boom::Rset, cfg(), None);
     expect(&mut client, b"220").await;
     client.write_all(b"RSET\r\n").await.unwrap();
     assert!(rest(&mut client).await.starts_with("421 "));

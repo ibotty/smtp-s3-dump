@@ -482,22 +482,30 @@ enum Dispatch<T: Transport> {
     Stop(Poll<T>),
 }
 
-fn hello<T: Transport>(mut session: Session<T>, host: &str, ehlo: bool) -> Dispatch<T> {
+#[derive(Clone, Copy)]
+enum Greeting {
+    Ehlo,
+    Helo,
+}
+
+fn hello<T: Transport>(mut session: Session<T>, host: &str, kind: Greeting) -> Dispatch<T> {
     match Domain::parse_client(host) {
         Ok(host) => {
             let req = EhloRequest {
                 session,
                 host,
-                ehlo,
+                kind,
             };
-            Dispatch::Stop(Poll::Event(if ehlo {
-                Event::Ehlo(req)
-            } else {
-                Event::Helo(req)
+            Dispatch::Stop(Poll::Event(match kind {
+                Greeting::Ehlo => Event::Ehlo(req),
+                Greeting::Helo => Event::Helo(req),
             }))
         }
         Err(_) => {
-            let name = if ehlo { "EHLO" } else { "HELO" };
+            let name = match kind {
+                Greeting::Ehlo => "EHLO",
+                Greeting::Helo => "HELO",
+            };
             session.push_reply(&Rejection::syntax_error(format!("invalid {name} domain")));
             Dispatch::Continue(session)
         }
@@ -506,8 +514,8 @@ fn hello<T: Transport>(mut session: Session<T>, host: &str, ehlo: bool) -> Dispa
 
 fn dispatch<T: Transport>(mut session: Session<T>, req: Request<String>) -> Dispatch<T> {
     match req {
-        Request::Ehlo { host } | Request::Lhlo { host } => hello(session, &host, true),
-        Request::Helo { host } => hello(session, &host, false),
+        Request::Ehlo { host } | Request::Lhlo { host } => hello(session, &host, Greeting::Ehlo),
+        Request::Helo { host } => hello(session, &host, Greeting::Helo),
         Request::Mail { from } => {
             if !matches!(session.phase, Phase::Greeted) {
                 session.push_reply(&Rejection::bad_sequence(
@@ -672,7 +680,7 @@ decide!(
 pub struct EhloRequest<T: Transport> {
     session: Session<T>,
     host: Domain,
-    ehlo: bool,
+    kind: Greeting,
 }
 
 /// `HELO` request; the same type as [`EhloRequest`].
@@ -686,11 +694,14 @@ impl<T: Transport> EhloRequest<T> {
 
     /// Accepts the EHLO (advertises capabilities) or HELO, (re)starting the transaction.
     pub fn accept(mut self) -> Session<T> {
-        if self.ehlo {
-            let ehlo = self.session.ehlo_response();
-            self.session.output.extend_from_slice(&ehlo);
-        } else {
-            let _ = write!(self.session.output, "250 {}\r\n", self.session.cfg.hostname);
+        match self.kind {
+            Greeting::Ehlo => {
+                let ehlo = self.session.ehlo_response();
+                self.session.output.extend_from_slice(&ehlo);
+            }
+            Greeting::Helo => {
+                let _ = write!(self.session.output, "250 {}\r\n", self.session.cfg.hostname);
+            }
         }
         self.session.phase = Phase::Greeted;
         self.session
