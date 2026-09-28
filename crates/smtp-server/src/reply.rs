@@ -162,6 +162,10 @@ impl Rejection {
         Self::build(421, 4, 3, 0, msg)
     }
 
+    pub(crate) fn too_many_rcpts() -> Self {
+        Self::build(452, 4, 5, 3, "too many recipients")
+    }
+
     pub(crate) fn syntax_error(msg: impl Into<String>) -> Self {
         Self::build(501, 5, 5, 4, msg)
     }

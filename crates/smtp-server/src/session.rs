@@ -12,7 +12,7 @@ use smtp_proto::{
 };
 
 use crate::Config;
-use crate::reply::{EnhancedCode, RejectCode, Rejection};
+use crate::reply::Rejection;
 use crate::types::{Domain, Envelope, NonEmpty, Recipient, Sender};
 
 /// Bytes accumulated while receiving `DATA`/`BDAT`, and the receiver that
@@ -110,23 +110,19 @@ impl Transport for Plain {
     }
 }
 
-impl Transport for Tls {
-    type StartTls = Infallible;
-    const OFFERS_STARTTLS: bool = false;
+macro_rules! no_starttls {
+    ($($t:ident),*) => {$(
+        impl Transport for $t {
+            type StartTls = Infallible;
+            const OFFERS_STARTTLS: bool = false;
 
-    fn start_tls_event(_session: Session<Self>) -> Event<Self> {
-        unreachable!("STARTTLS is never offered on Tls")
-    }
+            fn start_tls_event(_session: Session<Self>) -> Event<Self> {
+                unreachable!(concat!("STARTTLS is never offered on ", stringify!($t)))
+            }
+        }
+    )*};
 }
-
-impl Transport for Cleartext {
-    type StartTls = Infallible;
-    const OFFERS_STARTTLS: bool = false;
-
-    fn start_tls_event(_session: Session<Self>) -> Event<Self> {
-        unreachable!("STARTTLS is never offered on Cleartext")
-    }
-}
+no_starttls!(Tls, Cleartext);
 
 /// A single SMTP connection. Fed bytes via [`Session::feed`], driven forward
 /// via [`Session::poll`]; never does I/O itself.
@@ -284,6 +280,12 @@ impl<T: Transport> Session<T> {
         };
     }
 
+    /// Sends `r` and leaves the current phase untouched (unless `r` closes the session).
+    fn reject_keep_phase(&mut self, r: &Rejection) {
+        let phase = std::mem::replace(&mut self.phase, Phase::Fresh);
+        self.reply_and_continue(r, phase);
+    }
+
     fn into_transport<U: Transport>(self) -> Session<U> {
         Session {
             cfg: self.cfg,
@@ -352,11 +354,12 @@ impl<T: Transport> Session<T> {
     fn poll_commands(mut self) -> Poll<T> {
         loop {
             let mut it = self.input.iter();
-            match self.command.ingest(&mut it) {
+            let res = self.command.ingest(&mut it);
+            let consumed = self.input.len() - it.len();
+            match res {
                 Ok(req) => {
-                    let remaining = it.as_slice().to_vec();
                     let req = req.into_owned();
-                    self.input = remaining;
+                    self.input.drain(..consumed);
                     match dispatch(self, req) {
                         Dispatch::Continue(s) => self = s,
                         Dispatch::Stop(p) => return p,
@@ -367,8 +370,7 @@ impl<T: Transport> Session<T> {
                     return Poll::NeedInput(self);
                 }
                 Err(e) => {
-                    let remaining = it.as_slice().to_vec();
-                    self.input = remaining;
+                    self.input.drain(..consumed);
                     self.push_reply(&parse_error_reply(e));
                     self.bad_commands += 1;
                     if self.bad_commands >= self.cfg.max_bad_commands.get() {
@@ -378,6 +380,17 @@ impl<T: Transport> Session<T> {
                 }
             }
         }
+    }
+
+    /// Feeds buffered input to `receiver`, dropping what it consumed; returns whether the
+    /// payload finished and the bytes extracted.
+    fn ingest_payload(&mut self, receiver: &mut AnyReceiver) -> (bool, Vec<u8>) {
+        let mut out = Vec::new();
+        let mut it = self.input.iter();
+        let complete = receiver.ingest(&mut it, &mut out);
+        let consumed = self.input.len() - it.len();
+        self.input.drain(..consumed);
+        (complete, out)
     }
 
     fn poll_receiving(
@@ -394,11 +407,7 @@ impl<T: Transport> Session<T> {
             };
             return Poll::NeedInput(self);
         }
-        let mut chunk = Vec::new();
-        let mut it = self.input.iter();
-        let complete = receiver.ingest(&mut it, &mut chunk);
-        let remaining = it.as_slice().to_vec();
-        self.input = remaining;
+        let (complete, chunk) = self.ingest_payload(&mut receiver);
         size += chunk.len();
 
         if let Some(limit) = self.cfg.max_message_size
@@ -456,18 +465,13 @@ impl<T: Transport> Session<T> {
             self.phase = Phase::Discard { receiver, reply };
             return Poll::NeedInput(self);
         }
-        let mut discard = Vec::new();
-        let mut it = self.input.iter();
-        let complete = receiver.ingest(&mut it, &mut discard);
-        let remaining = it.as_slice().to_vec();
-        self.input = remaining;
+        let (complete, _) = self.ingest_payload(&mut receiver);
         if complete && receiver.is_last() {
             self.reply_and_continue(&reply, Phase::Greeted);
-            self.poll()
         } else {
             self.phase = Phase::Discard { receiver, reply };
-            self.poll()
         }
+        self.poll()
     }
 }
 
@@ -475,15 +479,6 @@ impl<T: Transport> Session<T> {
 enum Dispatch<T: Transport> {
     Continue(Session<T>),
     Stop(Poll<T>),
-}
-
-fn too_many_rcpts() -> Rejection {
-    Rejection::new(
-        RejectCode::new(452).expect("452 is a valid code"),
-        EnhancedCode::new(4, 5, 3).expect("4.5.3 is a valid code"),
-        "too many recipients",
-    )
-    .expect("452 and 4.5.3 share class 4")
 }
 
 fn dispatch<T: Transport>(mut session: Session<T>, req: Request<String>) -> Dispatch<T> {
@@ -538,7 +533,7 @@ fn dispatch<T: Transport>(mut session: Session<T>, req: Request<String>) -> Disp
             if let Phase::Rcpt { envelope } = &session.phase
                 && envelope.rcpts().len().get() >= session.cfg.max_rcpts.get() as usize
             {
-                session.push_reply(&too_many_rcpts());
+                session.push_reply(&Rejection::too_many_rcpts());
                 return Dispatch::Continue(session);
             }
             match Recipient::from_smtp(to, session.cfg.dsn) {
@@ -614,30 +609,20 @@ fn dispatch<T: Transport>(mut session: Session<T>, req: Request<String>) -> Disp
                 Dispatch::Continue(session)
             }
         }
-        Request::Noop { .. } | Request::Vrfy { .. } | Request::Help { .. }
-            if session.idle_commands >= session.cfg.max_idle_commands.get() =>
-        {
-            session.push_reply(&Rejection::closing("too many commands"));
-            Dispatch::Stop(Poll::Closed(session.take_output()))
-        }
-        Request::Noop { .. } => {
+        Request::Noop { .. } | Request::Vrfy { .. } | Request::Help { .. } => {
+            if session.idle_commands >= session.cfg.max_idle_commands.get() {
+                session.push_reply(&Rejection::closing("too many commands"));
+                return Dispatch::Stop(Poll::Closed(session.take_output()));
+            }
             session.idle_commands += 1;
-            push_ok(&mut session.output, 250, (2, 0, 0), "OK");
-            Dispatch::Continue(session)
-        }
-        Request::Vrfy { .. } => {
-            session.idle_commands += 1;
-            push_ok(
-                &mut session.output,
-                252,
-                (2, 5, 0),
-                "cannot VRFY user, but will accept message",
-            );
-            Dispatch::Continue(session)
-        }
-        Request::Help { .. } => {
-            session.idle_commands += 1;
-            push_ok(&mut session.output, 214, (2, 0, 0), "OK");
+            let (code, esc, text) = match req {
+                Request::Vrfy { .. } => {
+                    (252, (2, 5, 0), "cannot VRFY user, but will accept message")
+                }
+                Request::Help { .. } => (214, (2, 0, 0), "OK"),
+                _ => (250, (2, 0, 0), "OK"),
+            };
+            push_ok(&mut session.output, code, esc, text);
             Dispatch::Continue(session)
         }
         Request::Expn { .. }
@@ -650,6 +635,28 @@ fn dispatch<T: Transport>(mut session: Session<T>, req: Request<String>) -> Disp
         }
     }
 }
+
+macro_rules! decide {
+    ($($t:ident),*) => {$(
+        impl<T: Transport> $t<T> {
+            /// Accepts or rejects based on the handler's decision.
+            pub fn decide(self, r: Result<(), Rejection>) -> Session<T> {
+                match r {
+                    Ok(()) => self.accept(),
+                    Err(e) => self.reject(e),
+                }
+            }
+        }
+    )*};
+}
+decide!(
+    EhloRequest,
+    HeloRequest,
+    MailRequest,
+    RcptRequest,
+    DataStartRequest,
+    DataChunkRequest
+);
 
 /// `EHLO` request; decide whether to accept it.
 pub struct EhloRequest<T: Transport> {
@@ -673,17 +680,8 @@ impl<T: Transport> EhloRequest<T> {
 
     /// Rejects the EHLO; any transaction already in progress is left untouched.
     pub fn reject(mut self, r: Rejection) -> Session<T> {
-        let phase = std::mem::replace(&mut self.session.phase, Phase::Fresh);
-        self.session.reply_and_continue(&r, phase);
+        self.session.reject_keep_phase(&r);
         self.session
-    }
-
-    /// Accepts or rejects based on the handler's decision.
-    pub fn decide(self, r: Result<(), Rejection>) -> Session<T> {
-        match r {
-            Ok(()) => self.accept(),
-            Err(e) => self.reject(e),
-        }
     }
 }
 
@@ -709,17 +707,8 @@ impl<T: Transport> HeloRequest<T> {
 
     /// Rejects the HELO; any transaction already in progress is left untouched.
     pub fn reject(mut self, r: Rejection) -> Session<T> {
-        let phase = std::mem::replace(&mut self.session.phase, Phase::Fresh);
-        self.session.reply_and_continue(&r, phase);
+        self.session.reject_keep_phase(&r);
         self.session
-    }
-
-    /// Accepts or rejects based on the handler's decision.
-    pub fn decide(self, r: Result<(), Rejection>) -> Session<T> {
-        match r {
-            Ok(()) => self.accept(),
-            Err(e) => self.reject(e),
-        }
     }
 }
 
@@ -748,14 +737,6 @@ impl<T: Transport> MailRequest<T> {
     pub fn reject(mut self, r: Rejection) -> Session<T> {
         self.session.reply_and_continue(&r, Phase::Greeted);
         self.session
-    }
-
-    /// Accepts or rejects based on the handler's decision.
-    pub fn decide(self, r: Result<(), Rejection>) -> Session<T> {
-        match r {
-            Ok(()) => self.accept(),
-            Err(e) => self.reject(e),
-        }
     }
 }
 
@@ -798,17 +779,8 @@ impl<T: Transport> RcptRequest<T> {
 
     /// Rejects the recipient; the transaction (and any prior recipients) is kept.
     pub fn reject(mut self, r: Rejection) -> Session<T> {
-        let phase = std::mem::replace(&mut self.session.phase, Phase::Fresh);
-        self.session.reply_and_continue(&r, phase);
+        self.session.reject_keep_phase(&r);
         self.session
-    }
-
-    /// Accepts or rejects based on the handler's decision.
-    pub fn decide(self, r: Result<(), Rejection>) -> Session<T> {
-        match r {
-            Ok(()) => self.accept(),
-            Err(e) => self.reject(e),
-        }
     }
 }
 
@@ -851,14 +823,6 @@ impl<T: Transport> DataStartRequest<T> {
     pub fn reject(mut self, r: Rejection) -> Session<T> {
         self.session.reply_and_continue(&r, Phase::Greeted);
         self.session
-    }
-
-    /// Accepts or rejects based on the handler's decision.
-    pub fn decide(self, r: Result<(), Rejection>) -> Session<T> {
-        match r {
-            Ok(()) => self.accept(),
-            Err(e) => self.reject(e),
-        }
     }
 }
 
@@ -911,14 +875,6 @@ impl<T: Transport> DataChunkRequest<T> {
             None => self.session.reply_and_continue(&r, Phase::Greeted),
         }
         self.session
-    }
-
-    /// Accepts or rejects based on the handler's decision.
-    pub fn decide(self, r: Result<(), Rejection>) -> Session<T> {
-        match r {
-            Ok(()) => self.accept(),
-            Err(e) => self.reject(e),
-        }
     }
 }
 
