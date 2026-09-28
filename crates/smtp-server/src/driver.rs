@@ -21,7 +21,7 @@ use crate::{
 ///
 /// Handler futures are wrapped in `catch_unwind`: a panic closes the connection with `421`
 /// (`tracing::error!` is logged if the `tracing` feature is enabled) instead of taking the
-/// whole process down. Don't reuse `&mut Self` after [`serve`]/[`serve_tls`] returned due to a panic.
+/// whole process down. Don't reuse `&mut Self` after [`serve`] returned due to a panic.
 pub trait Handler: Send {
     /// React to `EHLO`.
     fn ehlo(
@@ -96,140 +96,70 @@ async fn catch<F: Future<Output = Result<R, Rejection>>, R>(fut: F) -> Result<R,
         })
 }
 
-/// Serves one connection. `tls` is the acceptor for an optional `STARTTLS` upgrade; pass
-/// `None` to run with no TLS support at all (`serve_tls` for implicit TLS instead).
-pub async fn serve<S, H>(
-    stream: S,
-    handler: &mut H,
-    cfg: Arc<Config>,
-    tls: Option<TlsAcceptor>,
-) -> io::Result<()>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send,
-    H: Handler,
-{
-    serve_inner(stream, handler, cfg, tls, None).await
+/// How a connection is (or is not) encrypted.
+#[derive(Clone)]
+pub enum TlsMode {
+    /// Plaintext only; `STARTTLS` is not offered.
+    None,
+    /// Plaintext, with `STARTTLS` on offer (submission/relay ports 25 and 587).
+    StartTls(TlsAcceptor),
+    /// The TLS handshake happens before any SMTP bytes (SMTPS, port 465); no `STARTTLS`.
+    Implicit(TlsAcceptor),
 }
 
-/// Like [`serve`], but stops gracefully once `shutdown` is triggered.
+/// Serves one connection.
 ///
-/// A connection that is idle (waiting for a command) gets `421 4.3.2` and is closed right away.
-/// A message being received (`DATA`/`BDAT` payload) or a running handler is never interrupted:
-/// the transaction finishes and is answered as usual, and the connection is closed with `421`
-/// once the server would wait for the client again. Clone one [`Shutdown`] per connection; it
-/// is level-triggered, so connections accepted after the trigger are closed immediately.
-/// Dropping the [`crate::ShutdownTrigger`] without triggering disables shutdown.
-pub async fn serve_until<S, H>(
-    stream: S,
-    handler: &mut H,
-    cfg: Arc<Config>,
-    tls: Option<TlsAcceptor>,
-    shutdown: Shutdown,
-) -> io::Result<()>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send,
-    H: Handler,
-{
-    serve_inner(stream, handler, cfg, tls, Some(shutdown)).await
-}
-
-async fn serve_inner<S, H>(
+/// With `shutdown`, the connection stops gracefully once it is triggered: a connection that is
+/// idle (waiting for a command) gets `421 4.3.2` and is closed right away. A message being
+/// received (`DATA`/`BDAT` payload) or a running handler is never interrupted: the transaction
+/// finishes and is answered as usual, and the connection is closed with `421` once the server
+/// would wait for the client again. Clone one [`Shutdown`] per connection; it is level-triggered,
+/// so connections accepted after the trigger are closed immediately. Dropping the
+/// [`crate::ShutdownTrigger`] without triggering disables shutdown.
+pub async fn serve<S, H>(
     mut stream: S,
     handler: &mut H,
     cfg: Arc<Config>,
-    tls: Option<TlsAcceptor>,
+    tls: TlsMode,
     mut shutdown: Option<Shutdown>,
 ) -> io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
     H: Handler,
 {
-    let Some(acceptor) = tls else {
-        run(
-            &mut stream,
-            Session::<Cleartext>::new(cfg.clone()),
-            handler,
-            &cfg,
-            &mut shutdown,
-        )
-        .await?;
-        return Ok(());
-    };
-    let Some(mut start_tls) = run(
-        &mut stream,
-        Session::<Plain>::new(cfg.clone()),
-        handler,
-        &cfg,
-        &mut shutdown,
-    )
-    .await?
-    else {
-        return Ok(());
-    };
-    stream.write_all(&start_tls.output()).await?;
-    let mut stream = acceptor.accept(stream).await?;
-    handler.rset().await;
-    run(
-        &mut stream,
-        start_tls.established(),
-        handler,
-        &cfg,
-        &mut shutdown,
-    )
-    .await?;
-    stream.shutdown().await
-}
-
-/// Serves one connection with implicit TLS: the handshake happens before any SMTP bytes.
-pub async fn serve_tls<S, H>(
-    stream: S,
-    handler: &mut H,
-    cfg: Arc<Config>,
-    tls: TlsAcceptor,
-) -> io::Result<()>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send,
-    H: Handler,
-{
-    serve_tls_inner(stream, handler, cfg, tls, None).await
-}
-
-/// [`serve_tls`] with the graceful shutdown of [`serve_until`].
-pub async fn serve_tls_until<S, H>(
-    stream: S,
-    handler: &mut H,
-    cfg: Arc<Config>,
-    tls: TlsAcceptor,
-    shutdown: Shutdown,
-) -> io::Result<()>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send,
-    H: Handler,
-{
-    serve_tls_inner(stream, handler, cfg, tls, Some(shutdown)).await
-}
-
-async fn serve_tls_inner<S, H>(
-    stream: S,
-    handler: &mut H,
-    cfg: Arc<Config>,
-    tls: TlsAcceptor,
-    mut shutdown: Option<Shutdown>,
-) -> io::Result<()>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send,
-    H: Handler,
-{
-    let mut stream = tls.accept(stream).await?;
-    run(
-        &mut stream,
-        Session::<Tls>::new(cfg.clone()),
-        handler,
-        &cfg,
-        &mut shutdown,
-    )
-    .await?;
-    stream.shutdown().await
+    match tls {
+        TlsMode::None => {
+            let session = Session::<Cleartext>::new(cfg.clone());
+            run(&mut stream, session, handler, &cfg, &mut shutdown).await?;
+            Ok(())
+        }
+        TlsMode::StartTls(acceptor) => {
+            let session = Session::<Plain>::new(cfg.clone());
+            let Some(mut start_tls) =
+                run(&mut stream, session, handler, &cfg, &mut shutdown).await?
+            else {
+                return Ok(());
+            };
+            stream.write_all(&start_tls.output()).await?;
+            let mut stream = acceptor.accept(stream).await?;
+            handler.rset().await;
+            run(
+                &mut stream,
+                start_tls.established(),
+                handler,
+                &cfg,
+                &mut shutdown,
+            )
+            .await?;
+            stream.shutdown().await
+        }
+        TlsMode::Implicit(acceptor) => {
+            let mut stream = acceptor.accept(stream).await?;
+            let session = Session::<Tls>::new(cfg.clone());
+            run(&mut stream, session, handler, &cfg, &mut shutdown).await?;
+            stream.shutdown().await
+        }
+    }
 }
 
 /// Resolves once shutdown was requested; never resolves without a (live) signal.

@@ -7,7 +7,7 @@ use std::sync::Arc;
 use mail_parser::{MessageParser, MimeHeaders};
 use smtp_server::{
     Config, Domain, Envelope, ForwardPath, Handler, Hostname, Recipient, Rejection, ReversePath,
-    Sender,
+    Sender, TlsMode,
 };
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
@@ -119,7 +119,10 @@ async fn main() -> io::Result<()> {
             domain: Domain::Name(hostname.clone()),
         };
         tokio::spawn(async move {
-            if let Err(e) = smtp_server::serve(socket, &mut handler, cfg, Some(acceptor)).await {
+            if let Err(e) =
+                smtp_server::serve(socket, &mut handler, cfg, TlsMode::StartTls(acceptor), None)
+                    .await
+            {
                 eprintln!("{peer}: {e}");
             }
             drop(permit);

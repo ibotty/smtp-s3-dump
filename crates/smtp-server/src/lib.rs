@@ -1,7 +1,7 @@
 //! A typesafe Sans-IO SMTP server core built on [`smtp_proto`].
 //!
 //! The state machine ([`Session`]) does no I/O; drive it with [`Session::feed`] and
-//! [`Session::poll`]. A Tokio driver ([`serve`]/[`serve_tls`]) is provided by default.
+//! [`Session::poll`]. A Tokio driver ([`serve`]) is provided by default.
 
 mod reply;
 mod session;
@@ -25,7 +25,7 @@ pub use types::{
 };
 
 #[cfg(feature = "tokio")]
-pub use driver::{Handler, serve, serve_tls, serve_tls_until, serve_until};
+pub use driver::{Handler, TlsMode, serve};
 #[cfg(feature = "tokio")]
 pub use shutdown::{Shutdown, ShutdownTrigger, shutdown_signal};
 

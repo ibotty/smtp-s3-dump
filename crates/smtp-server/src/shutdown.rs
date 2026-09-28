@@ -1,4 +1,4 @@
-//! A graceful-shutdown signal for [`crate::serve_until`] and [`crate::serve_tls_until`].
+//! A graceful-shutdown signal for [`crate::serve`].
 
 use std::future::pending;
 

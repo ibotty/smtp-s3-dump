@@ -2,7 +2,7 @@ use std::env;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use smtp_server::{shutdown_signal, Shutdown};
+use smtp_server::{shutdown_signal, Shutdown, TlsMode};
 use sqlx::postgres::PgPoolOptions;
 use tokio::net::TcpListener;
 use tokio::signal::unix::{signal, Signal, SignalKind};
@@ -159,8 +159,13 @@ async fn start_smtp_server(
                     let stop = stop.clone();
                     sessions.spawn(async move {
                         let acceptor = TlsAcceptor::from(session.config.tls_config.clone());
-                        if let Err(e) = smtp_server::serve_until(
-                            socket, &mut session, server_config, Some(acceptor), stop,
+                        if let Err(e) = smtp_server::serve(
+                            socket,
+                            &mut session,
+                            server_config,
+                            TlsMode::StartTls(acceptor),
+                            Some(stop),
+
                         )
                         .await
                         {

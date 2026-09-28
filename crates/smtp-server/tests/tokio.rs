@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use smtp_server::{Config, Envelope, Handler, Hostname, Recipient, Rejection, Sender};
+use smtp_server::{Config, Envelope, Handler, Hostname, Recipient, Rejection, Sender, TlsMode};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 struct Echo;
@@ -31,8 +31,9 @@ async fn buffered_transaction_with_two_recipients() {
     let (mut client, server) = tokio::io::duplex(4096);
     let cfg = cfg();
     let mut handler = Echo;
-    let task =
-        tokio::spawn(async move { smtp_server::serve(server, &mut handler, cfg, None).await });
+    let task = tokio::spawn(async move {
+        smtp_server::serve(server, &mut handler, cfg, TlsMode::None, None).await
+    });
 
     let mut buf = vec![0u8; 4096];
     let n = read(&mut client, &mut buf).await;
@@ -76,10 +77,9 @@ async fn command_timeout_closes_with_421() {
     let mut c = Config::new(Hostname::new("mx.example.org").unwrap());
     c.command_timeout = Duration::from_millis(100);
     let mut handler = Echo;
-    let task =
-        tokio::spawn(
-            async move { smtp_server::serve(server, &mut handler, Arc::new(c), None).await },
-        );
+    let task = tokio::spawn(async move {
+        smtp_server::serve(server, &mut handler, Arc::new(c), TlsMode::None, None).await
+    });
 
     let mut buf = vec![0u8; 4096];
     read(&mut client, &mut buf).await; // greeting
@@ -100,10 +100,9 @@ async fn data_deadline_closes_with_421() {
     let mut c = Config::new(Hostname::new("mx.example.org").unwrap());
     c.data_deadline = Duration::from_millis(100);
     let mut handler = Echo;
-    let task =
-        tokio::spawn(
-            async move { smtp_server::serve(server, &mut handler, Arc::new(c), None).await },
-        );
+    let task = tokio::spawn(async move {
+        smtp_server::serve(server, &mut handler, Arc::new(c), TlsMode::None, None).await
+    });
 
     let mut buf = vec![0u8; 4096];
     read(&mut client, &mut buf).await; // greeting
@@ -146,8 +145,9 @@ async fn panicking_handler_closes_with_421() {
     let (mut client, server) = tokio::io::duplex(4096);
     let cfg = cfg();
     let mut handler = Panicky;
-    let task =
-        tokio::spawn(async move { smtp_server::serve(server, &mut handler, cfg, None).await });
+    let task = tokio::spawn(async move {
+        smtp_server::serve(server, &mut handler, cfg, TlsMode::None, None).await
+    });
 
     let mut buf = vec![0u8; 4096];
     read(&mut client, &mut buf).await; // greeting
@@ -195,7 +195,7 @@ async fn shutdown_closes_idle_connection_with_421() {
     let (trigger, rx) = smtp_server::shutdown_signal();
     let mut handler = Echo;
     let task = tokio::spawn(async move {
-        smtp_server::serve_until(server, &mut handler, cfg(), None, rx).await
+        smtp_server::serve(server, &mut handler, cfg(), TlsMode::None, Some(rx)).await
     });
 
     expect(&mut client, b"220").await;
@@ -210,7 +210,7 @@ async fn shutdown_lets_message_in_flight_finish() {
     let (trigger, rx) = smtp_server::shutdown_signal();
     let mut handler = Echo;
     let task = tokio::spawn(async move {
-        smtp_server::serve_until(server, &mut handler, cfg(), None, rx).await
+        smtp_server::serve(server, &mut handler, cfg(), TlsMode::None, Some(rx)).await
     });
 
     expect(&mut client, b"220").await;
@@ -240,7 +240,7 @@ async fn connection_after_shutdown_gets_421_after_greeting() {
     trigger.trigger();
     let mut handler = Echo;
     let task = tokio::spawn(async move {
-        smtp_server::serve_until(server, &mut handler, cfg(), None, rx).await
+        smtp_server::serve(server, &mut handler, cfg(), TlsMode::None, Some(rx)).await
     });
 
     let all = rest(&mut client).await;
@@ -258,7 +258,7 @@ async fn dropped_trigger_does_not_shut_down() {
     drop(trigger);
     let mut handler = Echo;
     let task = tokio::spawn(async move {
-        smtp_server::serve_until(server, &mut handler, cfg(), None, rx).await
+        smtp_server::serve(server, &mut handler, cfg(), TlsMode::None, Some(rx)).await
     });
 
     expect(&mut client, b"220").await;
