@@ -1,4 +1,4 @@
-FROM registry.access.redhat.com/ubi9-minimal
+FROM registry.access.redhat.com/ubi10-minimal
 ARG BINARY=target/release/smtp-s3-dump
 ARG VERSION
 
