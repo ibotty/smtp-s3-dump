@@ -925,7 +925,12 @@ impl<T: Transport> DataEndRequest<T> {
 
     /// Accepts the message: `text` becomes the `250` reply.
     pub fn accept(mut self, text: impl AsRef<str>) -> Session<T> {
-        push_ok(&mut self.session.output, 250, (2, 0, 0), text.as_ref());
+        push_ok(
+            &mut self.session.output,
+            250,
+            (2, 0, 0),
+            &crate::reply::sanitize_text(text.as_ref()),
+        );
         self.session.phase = Phase::Greeted;
         self.session
     }

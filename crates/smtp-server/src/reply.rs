@@ -2,6 +2,14 @@
 
 use std::fmt;
 
+/// Replaces every control character (notably CR/LF) with a space, so reply text can
+/// never terminate its line early or inject further replies.
+pub(crate) fn sanitize_text(text: &str) -> String {
+    text.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
+}
+
 /// The numeric SMTP reply code of a [`Rejection`]: 4xx (transient) or 5xx (permanent) only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RejectCode(u16);
@@ -91,7 +99,7 @@ impl Rejection {
         Ok(Self {
             code,
             enhanced,
-            text: text.into(),
+            text: sanitize_text(&text.into()),
         })
     }
 
@@ -120,7 +128,7 @@ impl Rejection {
                 subject,
                 detail,
             },
-            text: text.into(),
+            text: sanitize_text(&text.into()),
         }
     }
 
@@ -206,7 +214,8 @@ impl Rejection {
         Self::build(421, 4, 3, 0, "too many unrecognized commands")
     }
 
-    /// Render as an SMTP reply line (or, for multi-line text, several lines with `-` continuations).
+    /// Render as a single SMTP reply line. Control characters (including CR/LF) in the text
+    /// are replaced with spaces on construction; multi-line text is not supported.
     pub(crate) fn write(&self, out: &mut Vec<u8>) {
         let resp = smtp_proto::Response::new(
             self.code.get(),
@@ -247,6 +256,21 @@ mod tests {
     use proptest::prelude::*;
 
     proptest! {
+        #[test]
+        fn rendered_reply_is_single_crlf_terminated_line(text in ".{0,40}", junk in "[\r\n\x00-\x1f]{0,6}") {
+            let text = format!("{junk}{text}\r\n250 injected{junk}");
+            let mut out = Vec::new();
+            Rejection::transient(text.as_str()).write(&mut out);
+            prop_assert!(out.ends_with(b"\r\n"));
+            let body = &out[..out.len() - 2];
+            prop_assert!(!body.iter().any(|b| *b == b'\r' || *b == b'\n'));
+            let mut out2 = Vec::new();
+            Rejection::new(RejectCode::new(550).unwrap(), EnhancedCode::new(5, 1, 1).unwrap(), text)
+                .unwrap()
+                .write(&mut out2);
+            prop_assert_eq!(out2.iter().filter(|b| **b == b'\n').count(), 1);
+        }
+
         #[test]
         fn reject_code_roundtrips_or_errors(code: u16) {
             if let Ok(rc) = RejectCode::new(code) {
