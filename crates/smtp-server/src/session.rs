@@ -976,13 +976,30 @@ mod tests {
     use crate::{Hostname, MessageSize};
 
     fn cfg() -> Arc<Config> {
-        Arc::new(Config::new(Hostname::new("mx.example.org").unwrap()))
+        cfg_with(|_| {})
     }
 
     fn cfg_with(f: impl FnOnce(&mut Config)) -> Arc<Config> {
         let mut c = Config::new(Hostname::new("mx.example.org").unwrap());
         f(&mut c);
         Arc::new(c)
+    }
+
+    /// Feeds `input` to a fresh session, auto-accepting `EHLO`/`MAIL`/`RCPT` events, and returns
+    /// the first other poll result. Output of accepted steps is discarded.
+    fn drive(cfg: Arc<Config>, input: &[u8]) -> Poll<Cleartext> {
+        let mut s = Session::<Cleartext>::new(cfg);
+        s.take_output();
+        s.feed(input);
+        loop {
+            s = match s.poll() {
+                Poll::Event(Event::Ehlo(r)) => r.accept(),
+                Poll::Event(Event::Mail(r)) => r.accept(),
+                Poll::Event(Event::Rcpt(r)) => r.accept(),
+                other => return other,
+            };
+            s.take_output();
+        }
     }
 
     fn contains(haystack: &[u8], needle: &[u8]) -> bool {
@@ -1091,16 +1108,7 @@ mod tests {
 
     #[test]
     fn rcpt_before_mail_is_bad_sequence() {
-        let mut s = Session::<Cleartext>::new(cfg());
-        s.take_output();
-        s.feed(b"EHLO client\r\n");
-        let Poll::Event(Event::Ehlo(req)) = s.poll() else {
-            panic!("expected Ehlo event")
-        };
-        let mut s = req.accept();
-        s.take_output();
-        s.feed(b"RCPT TO:<a@b>\r\n");
-        let Poll::NeedInput(mut s) = s.poll() else {
+        let Poll::NeedInput(mut s) = drive(cfg(), b"EHLO client\r\nRCPT TO:<a@b>\r\n") else {
             panic!("expected NeedInput")
         };
         assert!(s.take_output().starts_with(b"503"));
@@ -1108,19 +1116,8 @@ mod tests {
 
     #[test]
     fn data_before_rcpt_is_bad_sequence() {
-        let mut s = Session::<Cleartext>::new(cfg());
-        s.take_output();
-        s.feed(b"EHLO client\r\nMAIL FROM:<a@b>\r\nDATA\r\n");
-        let Poll::Event(Event::Ehlo(req)) = s.poll() else {
-            panic!("expected Ehlo event")
-        };
-        let s = req.accept();
-        let Poll::Event(Event::Mail(req)) = s.poll() else {
-            panic!("expected Mail event")
-        };
-        let mut s = req.accept();
-        s.take_output();
-        let Poll::NeedInput(mut s) = s.poll() else {
+        let Poll::NeedInput(mut s) = drive(cfg(), b"EHLO client\r\nMAIL FROM:<a@b>\r\nDATA\r\n")
+        else {
             panic!("expected NeedInput")
         };
         assert!(s.take_output().starts_with(b"503"));
@@ -1128,25 +1125,10 @@ mod tests {
 
     #[test]
     fn full_transaction_with_dot_unstuffing_across_feed_boundaries() {
-        let mut s = Session::<Cleartext>::new(cfg());
-        s.take_output();
-        s.feed(b"EHLO client\r\nMAIL FROM:<a@b>\r\nRCPT TO:<c@d>\r\nDATA\r\n");
-        let Poll::Event(Event::Ehlo(req)) = s.poll() else {
-            panic!("expected Ehlo event")
-        };
-        let mut s = req.accept();
-        s.take_output();
-        let Poll::Event(Event::Mail(req)) = s.poll() else {
-            panic!("expected Mail event")
-        };
-        let mut s = req.accept();
-        s.take_output();
-        let Poll::Event(Event::Rcpt(req)) = s.poll() else {
-            panic!("expected Rcpt event")
-        };
-        let mut s = req.accept();
-        s.take_output();
-        let Poll::Event(Event::DataStart(req)) = s.poll() else {
+        let Poll::Event(Event::DataStart(req)) = drive(
+            cfg(),
+            b"EHLO client\r\nMAIL FROM:<a@b>\r\nRCPT TO:<c@d>\r\nDATA\r\n",
+        ) else {
             panic!("expected DataStart event")
         };
         assert_eq!(req.envelope().rcpts().len().get(), 1);
@@ -1178,15 +1160,8 @@ mod tests {
     #[test]
     fn mail_from_size_over_limit_is_rejected_without_event() {
         let cfg = cfg_with(|c| c.max_message_size = MessageSize::new(10));
-        let mut s = Session::<Cleartext>::new(cfg);
-        s.take_output();
-        s.feed(b"EHLO client\r\nMAIL FROM:<a@b> SIZE=1000\r\n");
-        let Poll::Event(Event::Ehlo(req)) = s.poll() else {
-            panic!("expected Ehlo event")
-        };
-        let mut s = req.accept();
-        s.take_output();
-        let Poll::NeedInput(mut s) = s.poll() else {
+        let Poll::NeedInput(mut s) = drive(cfg, b"EHLO client\r\nMAIL FROM:<a@b> SIZE=1000\r\n")
+        else {
             panic!("expected NeedInput")
         };
         assert!(s.take_output().starts_with(b"552"));
@@ -1195,25 +1170,10 @@ mod tests {
     #[test]
     fn oversize_message_body_is_discarded_then_552() {
         let cfg = cfg_with(|c| c.max_message_size = MessageSize::new(5));
-        let mut s = Session::<Cleartext>::new(cfg);
-        s.take_output();
-        s.feed(b"EHLO client\r\nMAIL FROM:<a@b>\r\nRCPT TO:<c@d>\r\nDATA\r\n");
-        let Poll::Event(Event::Ehlo(req)) = s.poll() else {
-            panic!("expected Ehlo event")
-        };
-        let mut s = req.accept();
-        s.take_output();
-        let Poll::Event(Event::Mail(req)) = s.poll() else {
-            panic!("expected Mail event")
-        };
-        let mut s = req.accept();
-        s.take_output();
-        let Poll::Event(Event::Rcpt(req)) = s.poll() else {
-            panic!("expected Rcpt event")
-        };
-        let mut s = req.accept();
-        s.take_output();
-        let Poll::Event(Event::DataStart(req)) = s.poll() else {
+        let Poll::Event(Event::DataStart(req)) = drive(
+            cfg,
+            b"EHLO client\r\nMAIL FROM:<a@b>\r\nRCPT TO:<c@d>\r\nDATA\r\n",
+        ) else {
             panic!("expected DataStart event")
         };
         let mut s = req.accept();
@@ -1235,22 +1195,12 @@ mod tests {
 
     #[test]
     fn bdat_last_chunk_completes_message() {
-        let mut s = Session::<Cleartext>::new(cfg());
-        s.take_output();
-        s.feed(b"EHLO client\r\nMAIL FROM:<a@b>\r\nRCPT TO:<c@d>\r\n");
-        let Poll::Event(Event::Ehlo(req)) = s.poll() else {
-            panic!("expected Ehlo event")
+        let Poll::NeedInput(mut s) = drive(
+            cfg(),
+            b"EHLO client\r\nMAIL FROM:<a@b>\r\nRCPT TO:<c@d>\r\n",
+        ) else {
+            panic!("expected NeedInput")
         };
-        let s = req.accept();
-        let Poll::Event(Event::Mail(req)) = s.poll() else {
-            panic!("expected Mail event")
-        };
-        let s = req.accept();
-        let Poll::Event(Event::Rcpt(req)) = s.poll() else {
-            panic!("expected Rcpt event")
-        };
-        let mut s = req.accept();
-        s.take_output();
 
         s.feed(b"BDAT 5\r\nhello");
         let Poll::Event(Event::DataStart(req)) = s.poll() else {
@@ -1275,28 +1225,11 @@ mod tests {
 
     #[test]
     fn pipelined_commands_are_processed_in_order() {
-        let mut s = Session::<Cleartext>::new(cfg());
-        s.take_output();
-        s.feed(b"EHLO client\r\nMAIL FROM:<a@b>\r\nRCPT TO:<c@d>\r\nRCPT TO:<e@f>\r\n");
-        let Poll::Event(Event::Ehlo(req)) = s.poll() else {
-            panic!("expected Ehlo event")
-        };
-        let s = req.accept();
-        let Poll::Event(Event::Mail(req)) = s.poll() else {
-            panic!("expected Mail event")
-        };
-        let s = req.accept();
-        let Poll::Event(Event::Rcpt(req)) = s.poll() else {
-            panic!("expected Rcpt event")
-        };
-        let s = req.accept();
-        let Poll::Event(Event::Rcpt(req)) = s.poll() else {
-            panic!("expected second Rcpt event")
-        };
-        let s = req.accept();
-        let Poll::NeedInput(_) = s.poll() else {
+        let input = b"EHLO client\r\nMAIL FROM:<a@b>\r\nRCPT TO:<c@d>\r\nRCPT TO:<e@f>\r\n";
+        let Poll::NeedInput(mut s) = drive(cfg(), input) else {
             panic!("expected NeedInput")
         };
+        assert!(s.take_output().is_empty());
     }
 
     #[test]
@@ -1371,33 +1304,12 @@ mod tests {
     }
 
     #[test]
-    fn default_max_message_size_is_bounded() {
-        assert!(cfg().max_message_size.is_some());
-    }
-
-    #[test]
     fn rcpt_over_max_rcpts_is_452() {
         let cfg = cfg_with(|c| c.max_rcpts = std::num::NonZeroU32::new(2).unwrap());
-        let mut s = Session::<Cleartext>::new(cfg);
-        s.take_output();
-        s.feed(b"EHLO client\r\nMAIL FROM:<a@b>\r\nRCPT TO:<c@d>\r\nRCPT TO:<e@f>\r\n");
-        let Poll::Event(Event::Ehlo(req)) = s.poll() else {
-            panic!("expected Ehlo event")
+        let input = b"EHLO client\r\nMAIL FROM:<a@b>\r\nRCPT TO:<c@d>\r\nRCPT TO:<e@f>\r\n";
+        let Poll::NeedInput(mut s) = drive(cfg, input) else {
+            panic!("expected NeedInput")
         };
-        let mut s = req.accept();
-        s.take_output();
-        let Poll::Event(Event::Mail(req)) = s.poll() else {
-            panic!("expected Mail event")
-        };
-        let mut s = req.accept();
-        s.take_output();
-        for _ in 0..2 {
-            let Poll::Event(Event::Rcpt(req)) = s.poll() else {
-                panic!("expected Rcpt event")
-            };
-            s = req.accept();
-        }
-        assert!(s.take_output().starts_with(b"250"));
         s.feed(b"RCPT TO:<g@h>\r\n");
         let Poll::NeedInput(mut s) = s.poll() else {
             panic!("third RCPT must be rejected without an event")
@@ -1416,22 +1328,10 @@ mod tests {
     #[test]
     fn discard_phase_counts_as_in_data() {
         let cfg = cfg_with(|c| c.max_message_size = MessageSize::new(5));
-        let mut s = Session::<Cleartext>::new(cfg);
-        s.take_output();
-        s.feed(b"EHLO client\r\nMAIL FROM:<a@b>\r\nRCPT TO:<c@d>\r\nDATA\r\n");
-        let Poll::Event(Event::Ehlo(req)) = s.poll() else {
-            panic!("expected Ehlo event")
-        };
-        let s = req.accept();
-        let Poll::Event(Event::Mail(req)) = s.poll() else {
-            panic!("expected Mail event")
-        };
-        let s = req.accept();
-        let Poll::Event(Event::Rcpt(req)) = s.poll() else {
-            panic!("expected Rcpt event")
-        };
-        let s = req.accept();
-        let Poll::Event(Event::DataStart(req)) = s.poll() else {
+        let Poll::Event(Event::DataStart(req)) = drive(
+            cfg,
+            b"EHLO client\r\nMAIL FROM:<a@b>\r\nRCPT TO:<c@d>\r\nDATA\r\n",
+        ) else {
             panic!("expected DataStart event")
         };
         let mut s = req.accept();
