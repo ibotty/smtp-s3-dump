@@ -1,12 +1,10 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde_json::Value;
 use sqlx::postgres::PgPool;
-use tracing::{debug, info, instrument};
 
 /// `from` is the client-asserted `MAIL FROM`: it is not authenticated (no SMTP AUTH, SPF or DKIM),
 /// so consumers of the stored `"from"` column must not trust it.
 #[allow(clippy::too_many_arguments)]
-#[instrument(skip_all, fields(from, rcpt))]
 pub async fn insert_mail(
     pool: &PgPool,
     message_id: &str,
@@ -17,7 +15,6 @@ pub async fn insert_mail(
     headers: Value,
     attachments: Value,
 ) -> Result<()> {
-    debug!("inserting into DB");
     let query = sqlx::query!(
         r#"INSERT INTO data_gateways.smtp_gateway
             (message_id, "to", "from", body_text, body_html, headers, attachments)
@@ -31,15 +28,12 @@ pub async fn insert_mail(
         attachments
     );
 
-    let _ = query.execute(pool).await?;
+    let _ = query.execute(pool).await.context("insert mail")?;
     Ok(())
 }
 
-#[instrument(skip(pool))]
 pub async fn check_address(pool: &PgPool, from: &str, rcpt: &str) -> Result<bool> {
-    info!("checking DB");
     let query = sqlx::query!(r#"SELECT is_valid_rcpt($1, $2) AS "b!";"#, rcpt, from);
-    let res = query.fetch_one(pool).await?;
-    info!("checked DB, got {}", res.b);
+    let res = query.fetch_one(pool).await.context("check address")?;
     Ok(res.b)
 }

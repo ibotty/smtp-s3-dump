@@ -12,7 +12,6 @@ use tokio::task::JoinSet;
 use tokio_rustls::TlsAcceptor;
 use tracing::instrument;
 use tracing::{error, info, warn};
-use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 use crate::smtp::SmtpBackend;
@@ -52,7 +51,7 @@ fn is_wide_open<T>(rcpts: &Option<T>, froms: &Option<T>, check_db: bool) -> bool
 async fn main() -> Result<()> {
     // install global default tracing subscriber using RUST_LOG env variable
     tracing_subscriber::registry()
-        .with(fmt::layer().with_span_events(FmtSpan::NEW))
+        .with(fmt::layer())
         .with(EnvFilter::from_default_env())
         .init();
 
@@ -204,7 +203,7 @@ async fn start_smtp_server(
                         });
                         continue;
                     };
-                    let mut session = smtp_backend.new_session()?;
+                    let mut session = smtp_backend.new_session(addr)?;
                     let server_config = smtp_backend.server_config.clone();
                     let stop = stop.clone();
                     sessions.spawn(async move {

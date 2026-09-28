@@ -1,5 +1,7 @@
 use std::collections::HashSet;
+use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::{anyhow, Result};
 use arc_swap::ArcSwap;
@@ -10,7 +12,7 @@ use smtp_server::{
 };
 use sqlx::PgPool;
 use tokio_rustls::rustls::ServerConfig;
-use tracing::{debug, error, instrument, warn};
+use tracing::info;
 
 use crate::db;
 use crate::s3;
@@ -22,7 +24,6 @@ pub struct SmtpBackend {
 
 impl SmtpBackend {
     #[allow(clippy::too_many_arguments)]
-    #[instrument(skip(s3_config, pg_pool, tls_config))]
     pub fn new(
         s3_config: aws_sdk_s3::Config,
         pg_pool: PgPool,
@@ -49,17 +50,17 @@ impl SmtpBackend {
             allowed_froms,
             check_db,
         }));
-        debug!("got config");
         Ok(SmtpBackend {
             config,
             server_config: Arc::new(server_config),
         })
     }
 
-    #[instrument(skip_all)]
-    pub fn new_session(&self) -> Result<SmtpSession> {
+    pub fn new_session(&self, peer: SocketAddr) -> Result<SmtpSession> {
         Ok(SmtpSession {
             config: self.config.load_full(),
+            peer,
+            event: None,
         })
     }
 }
@@ -77,86 +78,132 @@ pub struct Config {
     pub check_db: bool,
 }
 
-pub struct SmtpSession {
-    pub config: Arc<Config>,
+struct MailEvent {
+    started: Instant,
+    peer: SocketAddr,
+    from: String,
+    rcpts: Vec<String>,
+    rejected: Vec<String>,
+    size: Option<usize>,
+    message_id: Option<String>,
+    stored: usize,
+    error: Option<String>,
 }
 
-impl Handler for SmtpSession {
-    #[instrument(skip_all)]
-    async fn mail(&mut self, sender: &Sender) -> Result<(), Rejection> {
-        match sender.path() {
-            ReversePath::Null => Err(Rejection::not_authorized("null sender not accepted")),
-            ReversePath::Mailbox(_) => Ok(()),
+impl MailEvent {
+    fn new(peer: SocketAddr, from: String) -> Self {
+        MailEvent {
+            started: Instant::now(),
+            peer,
+            from,
+            rcpts: vec![],
+            rejected: vec![],
+            size: None,
+            message_id: None,
+            stored: 0,
+            error: None,
         }
     }
 
-    #[instrument(skip_all)]
+    fn emit(self, outcome: &'static str) {
+        info!(
+            peer = %self.peer,
+            from = %self.from,
+            rcpts = ?self.rcpts,
+            rejected = ?self.rejected,
+            size = self.size,
+            message_id = self.message_id.as_deref(),
+            stored = self.stored,
+            outcome,
+            error = self.error.as_deref(),
+            duration_ms = self.started.elapsed().as_millis() as u64,
+            "mail"
+        );
+    }
+}
+
+pub struct SmtpSession {
+    pub config: Arc<Config>,
+    peer: SocketAddr,
+    event: Option<MailEvent>,
+}
+
+impl Drop for SmtpSession {
+    fn drop(&mut self) {
+        if let Some(ev) = self.event.take() {
+            let outcome = if ev.rcpts.is_empty() {
+                "rejected"
+            } else {
+                "abandoned"
+            };
+            ev.emit(outcome);
+        }
+    }
+}
+
+impl Handler for SmtpSession {
+    async fn mail(&mut self, sender: &Sender) -> Result<(), Rejection> {
+        if let Some(ev) = self.event.take() {
+            ev.emit("reset");
+        }
+        let mut ev = MailEvent::new(self.peer, sender.path().to_string());
+        match sender.path() {
+            ReversePath::Null => {
+                ev.error = Some("null sender".to_string());
+                ev.emit("rejected");
+                Err(Rejection::not_authorized("null sender not accepted"))
+            }
+            ReversePath::Mailbox(_) => {
+                self.event = Some(ev);
+                Ok(())
+            }
+        }
+    }
+
     async fn rcpt(&mut self, sender: &Sender, rcpt: &Recipient) -> Result<(), Rejection> {
-        debug!("handle RCPT");
         let rcpt = match rcpt.path() {
             ForwardPath::Postmaster => format!("postmaster@{}", self.config.domain),
             ForwardPath::Mailbox(m) => m.to_string(),
         };
-        let from = sender.path().to_string();
-        let unavailable = || Rejection::mailbox_unavailable("mailbox unavailable");
-
-        if self
-            .config
-            .allowed_rcpts
-            .as_ref()
-            .is_some_and(|c| !c.contains(&rcpt))
-        {
-            warn!("rejected mail due to RCPT address");
-            return Err(unavailable());
-        }
-
-        if self
-            .config
-            .allowed_froms
-            .as_ref()
-            .is_some_and(|c| !c.contains(&from))
-        {
-            warn!("rejected mail due to FROM address");
-            return Err(unavailable());
-        }
-
-        if self.config.check_db {
-            match db::check_address(&self.config.pg_pool, &from, &rcpt).await {
-                Ok(true) => {}
-                Ok(false) => {
-                    warn!("rejected mail due to DB check");
-                    return Err(unavailable());
-                }
-                Err(e) => {
-                    error!("could not handle request: {}", e);
-                    return Err(Rejection::transient("could not handle request"));
-                }
+        let result = self.check_rcpt(&sender.path().to_string(), &rcpt).await;
+        if let Some(ev) = &mut self.event {
+            match &result {
+                Ok(()) => ev.rcpts.push(rcpt),
+                Err((reason, _)) => ev.rejected.push(format!("{rcpt}:{reason}")),
             }
         }
-        Ok(())
+        result.map_err(|(_, r)| r)
     }
 
-    #[instrument(skip_all)]
     async fn data_end(&mut self, env: &Envelope, message: Vec<u8>) -> Result<String, Rejection> {
-        debug!("handle DATA");
-        let from = env.sender().path().to_string();
-        let reply = format!("Received {} bytes.", message.len());
-        let parsed = MessageParser::default()
-            .parse(&message)
-            .ok_or_else(|| Rejection::invalid_content("cannot parse message"))?;
-        validate(&parsed).map_err(Rejection::invalid_content)?;
-
-        for rcpt in env.rcpts().iter() {
-            let rcpt = match rcpt.path() {
-                ForwardPath::Postmaster => format!("postmaster@{}", self.config.domain),
-                ForwardPath::Mailbox(m) => m.to_string(),
-            };
-            self.store(&from, &rcpt, &parsed).await.map_err(|e| {
-                error!("could not handle request: {:?}", e);
-                Rejection::transient("could not handle request")
-            })?;
+        let mut ev = self
+            .event
+            .take()
+            .unwrap_or_else(|| MailEvent::new(self.peer, env.sender().path().to_string()));
+        ev.size = Some(message.len());
+        match self.store_all(&mut ev, env, &message).await {
+            Ok(reply) => {
+                ev.emit("stored");
+                Ok(reply)
+            }
+            Err((outcome, error, rejection)) => {
+                ev.error = Some(error);
+                ev.emit(outcome);
+                Err(rejection)
+            }
         }
-        Ok(reply)
+    }
+
+    async fn data_abort(&mut self) {
+        if let Some(ev) = self.event.take() {
+            ev.emit("aborted");
+        }
+    }
+
+    async fn rset(&mut self) {
+        if let Some(ev) = self.event.take() {
+            ev.emit("reset");
+        }
     }
 }
 
@@ -171,6 +218,83 @@ fn validate(message: &Message<'_>) -> Result<(), &'static str> {
 }
 
 impl SmtpSession {
+    async fn check_rcpt(&self, from: &str, rcpt: &str) -> Result<(), (String, Rejection)> {
+        let unavailable = |reason: &str| {
+            (
+                reason.to_string(),
+                Rejection::mailbox_unavailable("mailbox unavailable"),
+            )
+        };
+
+        if self
+            .config
+            .allowed_rcpts
+            .as_ref()
+            .is_some_and(|c| !c.contains(rcpt))
+        {
+            return Err(unavailable("rcpt_not_allowed"));
+        }
+
+        if self
+            .config
+            .allowed_froms
+            .as_ref()
+            .is_some_and(|c| !c.contains(from))
+        {
+            return Err(unavailable("from_not_allowed"));
+        }
+
+        if self.config.check_db {
+            match db::check_address(&self.config.pg_pool, from, rcpt).await {
+                Ok(true) => {}
+                Ok(false) => return Err(unavailable("db_denied")),
+                Err(e) => {
+                    return Err((
+                        format!("db_error: {e:#}"),
+                        Rejection::transient("could not handle request"),
+                    ))
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn store_all(
+        &self,
+        ev: &mut MailEvent,
+        env: &Envelope,
+        message: &[u8],
+    ) -> Result<String, (&'static str, String, Rejection)> {
+        let invalid = |e: &str| {
+            (
+                "invalid",
+                e.to_string(),
+                Rejection::invalid_content(e.to_string()),
+            )
+        };
+        let parsed = MessageParser::default()
+            .parse(message)
+            .ok_or_else(|| invalid("cannot parse message"))?;
+        ev.message_id = parsed.message_id().map(str::to_string);
+        validate(&parsed).map_err(invalid)?;
+
+        for rcpt in env.rcpts().iter() {
+            let rcpt = match rcpt.path() {
+                ForwardPath::Postmaster => format!("postmaster@{}", self.config.domain),
+                ForwardPath::Mailbox(m) => m.to_string(),
+            };
+            self.store(&ev.from, &rcpt, &parsed).await.map_err(|e| {
+                (
+                    "failed",
+                    format!("{e:#}"),
+                    Rejection::transient("could not handle request"),
+                )
+            })?;
+            ev.stored += 1;
+        }
+        Ok(format!("Received {} bytes.", message.len()))
+    }
+
     async fn store(&self, from: &str, rcpt: &str, message: &Message<'_>) -> Result<()> {
         s3::upload_message(
             &self.config.s3_config,

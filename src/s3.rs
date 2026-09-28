@@ -4,7 +4,6 @@ use futures::future::try_join_all;
 use mail_parser::{Message, MessagePart, MimeHeaders};
 use serde_json::{json, Map, Value};
 use sqlx::PgPool;
-use tracing::{debug, instrument};
 
 use crate::attachment;
 use crate::db;
@@ -96,7 +95,6 @@ fn plan_uploads(rcpt: &str, from: &str, message: &Message<'_>) -> Result<UploadP
     })
 }
 
-#[instrument(skip(s3_config, message, pg_pool), fields(message_id = message.message_id()))]
 pub async fn upload_message(
     s3_config: &aws_sdk_s3::Config,
     pg_pool: &PgPool,
@@ -105,8 +103,6 @@ pub async fn upload_message(
     rcpt: &str,
     message: Message<'_>,
 ) -> Result<()> {
-    debug!("uploading message");
-
     let plan = plan_uploads(rcpt, from, &message)?;
     let s3_client = aws_sdk_s3::Client::from_conf(s3_config.clone());
     try_join_all(
@@ -202,28 +198,25 @@ fn sanitize_key_component(s: &str) -> String {
     }
 }
 
-#[instrument(skip(s3_client, body))]
 async fn upload_file(
     s3_client: &aws_sdk_s3::Client,
     bucket: &str,
-    path: String,
+    key: String,
     body: Vec<u8>,
     content_type: Option<String>,
 ) -> Result<()> {
-    debug!(
-        "uploading file path={} content_type={}",
-        path,
-        content_type.as_deref().unwrap_or("")
-    );
-
     let s3_req = s3_client
         .put_object()
         .bucket(bucket)
         .body(ByteStream::from(body))
         .set_content_type(content_type)
-        .key(path);
+        .key(&key);
 
-    s3_req.send().await.map_err(aws_sdk_s3::Error::from)?;
+    s3_req
+        .send()
+        .await
+        .map_err(aws_sdk_s3::Error::from)
+        .with_context(|| format!("upload {key}"))?;
     Ok(())
 }
 
