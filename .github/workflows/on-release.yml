@@ -81,6 +81,10 @@ jobs:
         sudo apt-get install -y qemu-user-static
       if: ${{ env.ARCHS != 'amd64' }}
 
+    - name: Get version from Cargo.toml
+      id: version
+      run: echo "version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)" >> "$GITHUB_OUTPUT"
+
     - name: Build container
       id: build-image
       uses: redhat-actions/buildah-build@v2
@@ -90,6 +94,8 @@ jobs:
         archs: ${{ env.ARCHS }}
         oci: true
         containerfiles: ./Containerfile
+        build-args: |
+          VERSION=${{ steps.version.outputs.version }}
 
     - name: push to registry
       uses: redhat-actions/push-to-registry@v2
