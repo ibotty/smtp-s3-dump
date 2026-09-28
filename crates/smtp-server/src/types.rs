@@ -93,10 +93,11 @@ impl Domain {
     }
 }
 
-/// The local part of a mailbox (before the `@`): a dot-atom or quoted-string,
-/// already unquoted/unescaped by the caller if it came off the wire as a
-/// quoted-string. UTF-8 content is only legal when SMTPUTF8 was negotiated;
-/// that is a per-transaction decision enforced where the mailbox is built.
+/// The local part of a mailbox (before the `@`), in wire form: a dot-atom, or a
+/// quoted-string *including* its surrounding quotes and any `\` quoted-pairs.
+/// Validated per RFC 5321 §4.1.2 (atext / qtext / quoted-pair, no control
+/// characters). Non-ASCII UTF-8 is accepted as in RFC 6531; whether it is legal
+/// is a per-transaction SMTPUTF8 decision enforced where the mailbox is built.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct LocalPart(String);
 
@@ -115,14 +116,36 @@ impl LocalPart {
         if s.is_empty() {
             return Err(InvalidLocalPart("must not be empty"));
         }
-        if s.starts_with('"') {
-            if !s.ends_with('"') || s.len() < 2 {
-                return Err(InvalidLocalPart("unterminated quoted-string"));
+        if let Some(inner) = s.strip_prefix('"') {
+            let inner = inner
+                .strip_suffix('"')
+                .ok_or(InvalidLocalPart("unterminated quoted-string"))?;
+            let mut chars = inner.chars();
+            while let Some(c) = chars.next() {
+                let ok = match c {
+                    '\\' => chars.next().is_some_and(|q| matches!(q, ' '..='~')),
+                    '"' => false,
+                    ' '..='~' => true,
+                    c => !c.is_ascii() && !c.is_control(),
+                };
+                if !ok {
+                    return Err(InvalidLocalPart("invalid character in quoted-string"));
+                }
             }
         } else {
             for label in s.split('.') {
                 if label.is_empty() {
                     return Err(InvalidLocalPart("dot-atom must not have empty labels"));
+                }
+                let atext = |c: char| {
+                    if c.is_ascii() {
+                        c.is_ascii_alphanumeric() || "!#$%&'*+-/=?^_`{|}~".contains(c)
+                    } else {
+                        !c.is_control()
+                    }
+                };
+                if !label.chars().all(atext) {
+                    return Err(InvalidLocalPart("invalid character in dot-atom"));
                 }
             }
         }
@@ -619,6 +642,45 @@ mod tests {
         assert!(Recipient::from_smtp(to, false).is_err());
     }
 
+    #[test]
+    fn local_part_validation() {
+        for ok in [
+            "foo",
+            "a.b",
+            "a+b/c",
+            "\"a b\"",
+            "\"a\\\"b\"",
+            "\"a@b\"",
+            "\"\"",
+            "é.x",
+            "\"é\"",
+        ] {
+            assert!(LocalPart::new(ok).is_ok(), "{ok:?}");
+        }
+        for bad in [
+            "",
+            "a..b",
+            ".a",
+            "a b",
+            "a@b",
+            "a\\b",
+            "a\x00",
+            "a\x1b[0m",
+            "\"a\"b\"",
+            "\"a",
+            "\"",
+            "\"a\\\"",
+            "\"a\x00b\"",
+            "\"a\x1bb\"",
+            "\"a\x7fb\"",
+            "\"a\\\x00\"",
+            "a\u{85}",
+            "\"a\u{9b}\"",
+        ] {
+            assert!(LocalPart::new(bad).is_err(), "{bad:?}");
+        }
+    }
+
     use proptest::prelude::*;
 
     /// Strings biased towards SMTP-relevant characters (`@`, `.`, `"`, `\`, control
@@ -626,6 +688,11 @@ mod tests {
     /// arbitrary Unicode.
     fn smtp_ish_string() -> impl Strategy<Value = String> {
         proptest::string::string_regex(r#"[a-zA-Z0-9@.\x22\\ \x00-\x1f-]{0,20}"#).unwrap()
+    }
+
+    fn local_part_string() -> impl Strategy<Value = String> {
+        proptest::string::string_regex(r#"[a-z0-9@.\x22\\ /!#\x00-\x1f\x7f\u{80}-\u{9f}é-]{0,20}"#)
+            .unwrap()
     }
 
     proptest! {
@@ -646,6 +713,16 @@ mod tests {
         #[test]
         fn mailbox_parse_no_panic(s in smtp_ish_string()) {
             let _ = Mailbox::parse(&s);
+        }
+
+        #[test]
+        fn accepted_local_part_has_no_controls_and_roundtrips(s in local_part_string()) {
+            if let Ok(lp) = LocalPart::new(&s) {
+                let shown = lp.to_string();
+                prop_assert!(!shown.chars().any(char::is_control));
+                let m = Mailbox::parse(&format!("{shown}@example.org")).unwrap();
+                prop_assert_eq!(m.local(), &lp);
+            }
         }
     }
 }
