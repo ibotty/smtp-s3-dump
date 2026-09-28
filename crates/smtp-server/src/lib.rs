@@ -10,6 +10,8 @@ mod types;
 #[cfg(feature = "tokio")]
 mod driver;
 #[cfg(feature = "tokio")]
+mod limit;
+#[cfg(feature = "tokio")]
 mod shutdown;
 
 pub use reply::{EnhancedCode, InvalidRejection, RejectCode, Rejection};
@@ -26,6 +28,8 @@ pub use types::{
 
 #[cfg(feature = "tokio")]
 pub use driver::{Handler, TlsMode, serve};
+#[cfg(feature = "tokio")]
+pub use limit::{SessionGuard, SessionLimiter, reject_busy};
 #[cfg(feature = "tokio")]
 pub use shutdown::{Shutdown, ShutdownTrigger, shutdown_signal};
 
