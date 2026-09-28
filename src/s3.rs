@@ -9,6 +9,93 @@ use tracing::{debug, instrument};
 use crate::attachment;
 use crate::db;
 
+struct Upload {
+    key: String,
+    body: Vec<u8>,
+    content_type: Option<String>,
+}
+
+struct UploadPlan {
+    message_id: String,
+    uploads: Vec<Upload>,
+    body_text: String,
+    body_html: String,
+    headers: Value,
+    attachments: Value,
+}
+
+fn plan_uploads(rcpt: &str, from: &str, message: &Message<'_>) -> Result<UploadPlan> {
+    let message_id = message.message_id().context("mail has no message id")?;
+    let date = message.date().context("mail has no date")?.to_rfc3339();
+    let base_path = format!(
+        "{}/{}/{}-{}/",
+        sanitize_key_component(&rcpt.to_lowercase()),
+        sanitize_key_component(from),
+        sanitize_key_component(&date),
+        sanitize_key_component(message_id),
+    );
+
+    let mut uploads = vec![];
+    let mut attachments = vec![];
+    for (ix, part) in message.attachments().enumerate() {
+        let filename = sanitize_filename(part.attachment_name().unwrap_or_default());
+        let key = format!("{}attachments/{:02}-{}", base_path, ix, filename);
+        let part_type = part
+            .content_type()
+            .and_then(|ct| Some(format!("{}/{}", ct.ctype(), ct.subtype()?).to_lowercase()));
+        let content_type = content_type(&key, part_type);
+        attachments.push(json!({
+            "index": ix,
+            "filename": filename,
+            "rel_path": key,
+            "content_type": content_type,
+        }));
+        uploads.push(Upload {
+            body: attachment::attachment_bytes(message, part),
+            key,
+            content_type,
+        });
+    }
+
+    let headers = headers_to_json(message.headers_raw());
+    let mut push = |name: &str, body: Vec<u8>| {
+        let key = format!("{base_path}{name}");
+        uploads.push(Upload {
+            content_type: content_type_from_path(&key),
+            key,
+            body,
+        });
+    };
+    push("headers.json", serde_json::to_vec_pretty(&headers)?);
+
+    // this selects only the first part
+    let body_text = message.text_bodies().next();
+    if let Some(part) = body_text {
+        push("body.txt", part.contents().to_vec());
+    }
+
+    // this selects only the first part
+    let body_html = message.html_bodies().next();
+    if let Some(part) = body_html {
+        push("body.html", part.contents().to_vec());
+    }
+
+    let trimmed = |part: Option<&MessagePart<'_>>| {
+        part.and_then(MessagePart::text_contents)
+            .unwrap_or("")
+            .trim()
+            .to_string()
+    };
+    Ok(UploadPlan {
+        message_id: message_id.to_string(),
+        uploads,
+        body_text: trimmed(body_text),
+        body_html: trimmed(body_html),
+        headers,
+        attachments: Value::Array(attachments),
+    })
+}
+
 #[instrument(skip(s3_config, message, pg_pool), fields(message_id = message.message_id()))]
 pub async fn upload_message(
     s3_config: &aws_sdk_s3::Config,
@@ -20,101 +107,25 @@ pub async fn upload_message(
 ) -> Result<()> {
     debug!("uploading message");
 
-    let message_id = message.message_id().context("mail has no message id")?;
-    let date = message.date().context("mail has no date")?.to_rfc3339();
-    let base_path = format!(
-        "{}/{}/{}-{}/",
-        sanitize_key_component(&rcpt.to_lowercase()),
-        sanitize_key_component(from),
-        sanitize_key_component(&date),
-        sanitize_key_component(message_id),
-    );
-
+    let plan = plan_uploads(rcpt, from, &message)?;
     let s3_client = aws_sdk_s3::Client::from_conf(s3_config.clone());
-
-    // attachments uploads
-    let mut attachments_metadata = vec![];
-    let mut uploads = message
-        .attachments()
-        .enumerate()
-        .map(|(ix, part)| {
-            let attachment_name = sanitize_filename(part.attachment_name().unwrap_or_default());
-            let body = attachment::attachment_bytes(&message, part);
-            let path = format!("{}attachments/{:02}-{}", base_path, ix, attachment_name);
-            let part_type = part
-                .content_type()
-                .and_then(|ct| Some(format!("{}/{}", ct.ctype(), ct.subtype()?).to_lowercase()));
-            let content_type = content_type(&path, part_type);
-
-            let metadata = json!({
-                "index": ix,
-                "filename": attachment_name,
-                "rel_path": path,
-                "content_type": content_type,
-            });
-
-            attachments_metadata.push(metadata);
-
-            Ok(upload_file(&s3_client, bucket, path, body, content_type))
-        })
-        .collect::<Result<Vec<_>>>()?;
-
-    let headers_value = headers_to_json(message.headers_raw());
-    let headers_json = serde_json::to_vec_pretty(&headers_value)?;
-    let headers_path = format!("{}headers.json", base_path);
-    uploads.push(upload_file(
-        &s3_client,
-        bucket,
-        headers_path,
-        headers_json,
-        None,
-    ));
-
-    // this selects only the first part
-    let body_text = message.text_bodies().next();
-    if let Some(body_text) = body_text {
-        let body_text_path = format!("{}body.txt", base_path);
-        uploads.push(upload_file(
-            &s3_client,
-            bucket,
-            body_text_path,
-            body_text.contents().to_vec(),
-            None,
-        ));
-    }
-
-    // this selects only the first part
-    let body_html = message.html_bodies().next();
-    if let Some(body_html) = body_html {
-        let body_html_path = format!("{}body.html", base_path);
-        uploads.push(upload_file(
-            &s3_client,
-            bucket,
-            body_html_path,
-            body_html.contents().to_vec(),
-            None,
-        ));
-    }
-
-    // run upload futures
-    try_join_all(uploads).await?;
+    try_join_all(
+        plan.uploads
+            .into_iter()
+            .map(|u| upload_file(&s3_client, bucket, u.key, u.body, u.content_type)),
+    )
+    .await?;
 
     // afterwards, when complete, insert into DB
     db::insert_mail(
         pg_pool,
-        message_id,
+        &plan.message_id,
         rcpt,
         from,
-        body_text
-            .and_then(MessagePart::text_contents)
-            .unwrap_or("")
-            .trim(),
-        body_html
-            .and_then(MessagePart::text_contents)
-            .unwrap_or("")
-            .trim(),
-        headers_value,
-        serde_json::to_value(attachments_metadata)?,
+        &plan.body_text,
+        &plan.body_html,
+        plan.headers,
+        plan.attachments,
     )
     .await?;
     Ok(())
@@ -199,8 +210,6 @@ async fn upload_file(
     body: Vec<u8>,
     content_type: Option<String>,
 ) -> Result<()> {
-    let content_type = content_type.or_else(|| content_type_from_path(&path));
-
     debug!(
         "uploading file path={} content_type={}",
         path,
@@ -220,8 +229,158 @@ async fn upload_file(
 
 #[cfg(test)]
 mod tests {
-    use super::{content_type, headers_to_json, sanitize_filename, sanitize_key_component};
+    use super::{
+        content_type, headers_to_json, plan_uploads, sanitize_filename, sanitize_key_component,
+    };
+    use mail_parser::MessageParser;
     use serde_json::json;
+
+    const EML: &str = concat!(
+        "Received: from a\r\n",
+        "Received: from b\r\n",
+        "Message-ID: <id.1@example.org>\r\n",
+        "Date: Mon, 1 Jan 2024 00:00:00 +0000\r\n",
+        "Subject: hi\r\n",
+        "MIME-Version: 1.0\r\n",
+        "Content-Type: multipart/mixed; boundary=\"m\"\r\n",
+        "\r\n",
+        "--m\r\n",
+        "Content-Type: multipart/alternative; boundary=\"a\"\r\n",
+        "\r\n",
+        "--a\r\n",
+        "Content-Type: text/plain\r\n",
+        "\r\n",
+        " plain body \r\n",
+        "--a\r\n",
+        "Content-Type: text/html\r\n",
+        "\r\n",
+        "<p>html body</p>\r\n",
+        "--a--\r\n",
+        "--m\r\n",
+        "Content-Type: application/pdf; name=\"a.pdf\"\r\n",
+        "Content-Disposition: attachment; filename=\"a.pdf\"\r\n",
+        "Content-Transfer-Encoding: base64\r\n",
+        "\r\n",
+        "AAECAw==\r\n",
+        "--m\r\n",
+        "Content-Type: application/x-custom\r\n",
+        "Content-Disposition: attachment; filename=\"../evil\"\r\n",
+        "Content-Transfer-Encoding: base64\r\n",
+        "\r\n",
+        "aGk=\r\n",
+        "--m\r\n",
+        "Content-Type: application/octet-stream\r\n",
+        "Content-Disposition: attachment\r\n",
+        "Content-Transfer-Encoding: base64\r\n",
+        "\r\n",
+        "AQ==\r\n",
+        "--m--\r\n",
+    );
+
+    fn plan(rcpt: &str, from: &str, eml: &str) -> anyhow::Result<super::UploadPlan> {
+        plan_uploads(
+            rcpt,
+            from,
+            &MessageParser::default().parse(eml.as_bytes()).unwrap(),
+        )
+    }
+
+    #[test]
+    fn plans_keys_bodies_and_content_types() {
+        let p = plan("Alice@Example.org", "bob@example.org", EML).unwrap();
+        let base = "alice@example.org/bob@example.org/2024-01-01T00:00:00Z-id.1@example.org/";
+        let got: Vec<_> = p
+            .uploads
+            .iter()
+            .map(|u| (u.key.as_str(), u.content_type.as_deref()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (
+                    format!("{base}attachments/00-a.pdf"),
+                    Some("application/pdf")
+                ),
+                (
+                    format!("{base}attachments/01-evil"),
+                    Some("application/x-custom")
+                ),
+                (
+                    format!("{base}attachments/02-attachment"),
+                    Some("application/octet-stream")
+                ),
+                (format!("{base}headers.json"), Some("application/json")),
+                (format!("{base}body.txt"), Some("text/plain")),
+                (format!("{base}body.html"), Some("text/html")),
+            ]
+            .iter()
+            .map(|(k, c)| (k.as_str(), *c))
+            .collect::<Vec<_>>()
+        );
+        assert_eq!(p.message_id, "id.1@example.org");
+        assert_eq!(p.body_text, "plain body");
+        assert_eq!(p.body_html, "<p>html body</p>");
+    }
+
+    #[test]
+    fn plans_attachment_wire_bytes_and_metadata() {
+        let p = plan("a@b", "c@d", EML).unwrap();
+        let bodies: Vec<_> = p.uploads[..3].iter().map(|u| u.body.as_slice()).collect();
+        assert_eq!(bodies, [&[0u8, 1, 2, 3][..], b"hi", &[1]]);
+        let base = "a@b/c@d/2024-01-01T00:00:00Z-id.1@example.org/attachments";
+        assert_eq!(
+            p.attachments,
+            json!([
+                {"index": 0, "filename": "a.pdf", "rel_path": format!("{base}/00-a.pdf"), "content_type": "application/pdf"},
+                {"index": 1, "filename": "evil", "rel_path": format!("{base}/01-evil"), "content_type": "application/x-custom"},
+                {"index": 2, "filename": "attachment", "rel_path": format!("{base}/02-attachment"), "content_type": "application/octet-stream"},
+            ])
+        );
+    }
+
+    #[test]
+    fn plans_headers_matching_headers_json() {
+        let p = plan("a@b", "c@d", EML).unwrap();
+        assert_eq!(p.headers["Subject"], "hi");
+        assert_eq!(p.headers["Received"], json!(["from a", "from b"]));
+        let stored = p
+            .uploads
+            .iter()
+            .find(|u| u.key.ends_with("/headers.json"))
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&stored.body).unwrap(),
+            p.headers
+        );
+    }
+
+    #[test]
+    fn plans_without_attachments() {
+        let eml = "Message-ID: <a@b>\r\nDate: Mon, 1 Jan 2024 00:00:00 +0000\r\n\r\n";
+        let p = plan("r@x", "s@y", eml).unwrap();
+        let keys: Vec<_> = p.uploads.iter().map(|u| u.key.as_str()).collect();
+        assert!(keys.iter().all(|k| !k.contains("attachments/")));
+        assert!(keys.iter().any(|k| k.ends_with("/headers.json")));
+        assert_eq!(p.attachments, json!([]));
+    }
+
+    #[test]
+    fn plans_hostile_components_into_fixed_depth() {
+        let eml = "Message-ID: <../../x/y>\r\nDate: Mon, 1 Jan 2024 00:00:00 +0000\r\n\r\nhi\r\n";
+        let p = plan("../r@x", "\"../s\"@y", eml).unwrap();
+        for u in &p.uploads {
+            assert_eq!(u.key.matches('/').count(), 3, "{}", u.key);
+            assert!(!u.key.contains(".."), "{}", u.key);
+        }
+    }
+
+    #[test]
+    fn plan_requires_message_id_and_date() {
+        let no_id = "Date: Mon, 1 Jan 2024 00:00:00 +0000\r\n\r\nhi\r\n";
+        let no_date = "Message-ID: <a@b>\r\n\r\nhi\r\n";
+        assert!(plan("a@b", "c@d", no_id).is_err());
+        assert!(plan("a@b", "c@d", no_date).is_err());
+    }
 
     #[test]
     fn content_type_prefers_extension_then_part_type() {
