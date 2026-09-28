@@ -8,6 +8,7 @@ use serde_json::json;
 use sqlx::PgPool;
 use tracing::{debug, instrument};
 
+use crate::attachment;
 use crate::db;
 
 #[instrument(skip(s3_config, message, pg_pool), fields(message_id = message.message_id()))]
@@ -32,11 +33,9 @@ pub async fn upload_message(
     let mut uploads = message
         .attachments()
         .enumerate()
-        .map(|(ix, attachment)| {
-            let attachment_name = attachment
-                .attachment_name()
-                .context("attachment has no name")?;
-            let body = attachment.contents();
+        .map(|(ix, part)| {
+            let attachment_name = part.attachment_name().context("attachment has no name")?;
+            let body = attachment::attachment_bytes(&message, part);
             let path = format!("{}attachments/{:02}-{}", base_path, ix, attachment_name);
 
             let metadata = json!({
@@ -48,7 +47,7 @@ pub async fn upload_message(
 
             attachments_metadata.push(metadata);
 
-            Ok(upload_file(&s3_client, bucket, path, body.to_vec()))
+            Ok(upload_file(&s3_client, bucket, path, body))
         })
         .collect::<Result<Vec<_>>>()?;
 

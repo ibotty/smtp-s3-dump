@@ -12,11 +12,24 @@
 //!   UTF-8, so even a successfully-decoded charset (e.g. UTF-16LE) loses its BOM and
 //!   its original encoding entirely.
 //!
-//! The tests below pin down this behavior with minimal fixtures built by hand
-//! (`MessageParser`, no S3/DB involved). The byte-preserving replacement for
-//! `MessagePart::contents()` -- slicing `raw_message` by `offset_body`/`offset_end`
-//! and undoing only `Encoding::{Base64,QuotedPrintable}` -- will be added to this
-//! module next, called from `s3::upload_message` instead of `.contents()`.
+//! `is_encoding_problem` does not flag any of this: it's only set for malformed
+//! message structure, never for a lossy charset fallback.
+
+use mail_parser::decoders::base64::base64_decode;
+use mail_parser::decoders::quoted_printable::quoted_printable_decode;
+use mail_parser::{Encoding, Message, MessagePart};
+
+/// Returns a MIME part's contents as the exact bytes that were on the wire,
+/// undoing only the `Content-Transfer-Encoding` -- never the charset/text
+/// decoding that `MessagePart::contents()` applies to `text/*` parts.
+pub fn attachment_bytes(message: &Message<'_>, part: &MessagePart<'_>) -> Vec<u8> {
+    let raw = &message.raw_message()[part.offset_body as usize..part.offset_end as usize];
+    match part.encoding {
+        Encoding::Base64 => base64_decode(raw).unwrap_or_default(),
+        Encoding::QuotedPrintable => quoted_printable_decode(raw).unwrap_or_default(),
+        Encoding::None => raw.to_vec(),
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -50,13 +63,11 @@ mod tests {
         let message = MessageParser::default()
             .parse(eml)
             .expect("fixture message must parse");
-        let bytes = message
+        let part = message
             .attachments()
             .next()
-            .expect("fixture message must have an attachment")
-            .contents()
-            .to_vec();
-        bytes
+            .expect("fixture message must have an attachment");
+        super::attachment_bytes(&message, part)
     }
 
     fn utf16le_with_bom(s: &str) -> Vec<u8> {
