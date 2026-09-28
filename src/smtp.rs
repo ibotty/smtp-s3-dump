@@ -3,9 +3,10 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
 use arc_swap::ArcSwap;
-use mail_parser::MessageParser;
+use mail_parser::{Message, MessageParser};
 use smtp_server::{
-    Envelope, ForwardPath, Handler, Hostname, MessageSize, Recipient, Rejection, Sender,
+    Envelope, ForwardPath, Handler, Hostname, MessageSize, Recipient, Rejection, ReversePath,
+    Sender,
 };
 use sqlx::PgPool;
 use tokio_rustls::rustls::ServerConfig;
@@ -80,6 +81,14 @@ pub struct SmtpSession {
 
 impl Handler for SmtpSession {
     #[instrument(skip_all)]
+    async fn mail(&mut self, sender: &Sender) -> Result<(), Rejection> {
+        match sender.path() {
+            ReversePath::Null => Err(Rejection::not_authorized("null sender not accepted")),
+            ReversePath::Mailbox(_) => Ok(()),
+        }
+    }
+
+    #[instrument(skip_all)]
     async fn rcpt(&mut self, sender: &Sender, rcpt: &Recipient) -> Result<(), Rejection> {
         debug!("handle RCPT");
         let rcpt = match rcpt.path() {
@@ -130,13 +139,17 @@ impl Handler for SmtpSession {
         debug!("handle DATA");
         let from = env.sender().path().to_string();
         let reply = format!("Received {} bytes.", message.len());
+        let parsed = MessageParser::default()
+            .parse(&message)
+            .ok_or_else(|| Rejection::invalid_content("cannot parse message"))?;
+        validate(&parsed).map_err(Rejection::invalid_content)?;
 
         for rcpt in env.rcpts().iter() {
             let rcpt = match rcpt.path() {
                 ForwardPath::Postmaster => format!("postmaster@{}", self.config.domain),
                 ForwardPath::Mailbox(m) => m.to_string(),
             };
-            self.store(&from, &rcpt, &message).await.map_err(|e| {
+            self.store(&from, &rcpt, &parsed).await.map_err(|e| {
                 error!("could not handle request: {:?}", e);
                 Rejection::transient("could not handle request")
             })?;
@@ -145,19 +158,54 @@ impl Handler for SmtpSession {
     }
 }
 
+fn validate(message: &Message<'_>) -> Result<(), &'static str> {
+    if message.message_id().is_none() {
+        return Err("message has no Message-ID");
+    }
+    if message.date().is_none() {
+        return Err("message has no Date");
+    }
+    Ok(())
+}
+
 impl SmtpSession {
-    async fn store(&self, from: &str, rcpt: &str, data: &[u8]) -> Result<()> {
-        let message = MessageParser::default()
-            .parse(data)
-            .ok_or_else(|| anyhow!("Cannot parse message"))?;
+    async fn store(&self, from: &str, rcpt: &str, message: &Message<'_>) -> Result<()> {
         s3::upload_message(
             &self.config.s3_config,
             &self.config.pg_pool,
             &self.config.bucket,
             from,
             rcpt,
-            message,
+            message.clone(),
         )
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn check(eml: &str) -> Result<(), &'static str> {
+        validate(&MessageParser::default().parse(eml.as_bytes()).unwrap())
+    }
+
+    const HEAD: &str = "Message-ID: <a@b>\r\nDate: Mon, 1 Jan 2024 00:00:00 +0000\r\nFrom: a@b\r\n";
+
+    #[test]
+    fn accepts_complete_message() {
+        assert_eq!(check(&format!("{HEAD}\r\nhi\r\n")), Ok(()));
+    }
+
+    #[test]
+    fn rejects_missing_message_id() {
+        let eml = "Date: Mon, 1 Jan 2024 00:00:00 +0000\r\nFrom: a@b\r\n\r\nhi\r\n";
+        assert_eq!(check(eml), Err("message has no Message-ID"));
+    }
+
+    #[test]
+    fn rejects_missing_date() {
+        let eml = "Message-ID: <a@b>\r\nFrom: a@b\r\n\r\nhi\r\n";
+        assert_eq!(check(eml), Err("message has no Date"));
     }
 }

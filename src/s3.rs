@@ -34,7 +34,7 @@ pub async fn upload_message(
         .attachments()
         .enumerate()
         .map(|(ix, part)| {
-            let attachment_name = part.attachment_name().context("attachment has no name")?;
+            let attachment_name = sanitize_filename(part.attachment_name().unwrap_or_default());
             let body = attachment::attachment_bytes(&message, part);
             let path = format!("{}attachments/{:02}-{}", base_path, ix, attachment_name);
 
@@ -105,6 +105,25 @@ pub async fn upload_message(
     Ok(())
 }
 
+/// Makes an attachment name safe to embed in an S3 key: drops `/` and `\\`, collapses runs of
+/// dots and strips leading ones (so no `..` or hidden files), falls back to `attachment`.
+/// Single dots are kept, since the extension drives the guessed content type.
+fn sanitize_filename(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for c in name.chars().filter(|c| !matches!(c, '/' | '\\')) {
+        if c == '.' && (out.is_empty() || out.ends_with('.')) {
+            continue;
+        }
+        out.push(c);
+    }
+    let out = out.trim().to_string();
+    if out.is_empty() {
+        "attachment".to_string()
+    } else {
+        out
+    }
+}
+
 #[instrument(skip(s3_client, body))]
 async fn upload_file(
     s3_client: &aws_sdk_s3::Client,
@@ -129,4 +148,27 @@ async fn upload_file(
 
     s3_req.send().await.map_err(aws_sdk_s3::Error::from)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sanitize_filename;
+
+    #[test]
+    fn sanitizes_filenames() {
+        for (input, want) in [
+            ("report.pdf", "report.pdf"),
+            ("archive.tar.gz", "archive.tar.gz"),
+            ("../../etc/passwd", "etcpasswd"),
+            ("a/b\\c.txt", "abc.txt"),
+            ("..hidden", "hidden"),
+            ("a..b.txt", "a.b.txt"),
+            ("...", "attachment"),
+            ("/", "attachment"),
+            ("   ", "attachment"),
+            ("", "attachment"),
+        ] {
+            assert_eq!(sanitize_filename(input), want, "input {input:?}");
+        }
+    }
 }
