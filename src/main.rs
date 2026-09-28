@@ -33,6 +33,10 @@ async fn main() -> Result<()> {
         .with(EnvFilter::from_default_env())
         .init();
 
+    tokio_rustls::rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("failed to install default rustls crypto provider");
+
     let smtp_bind_addr = env::var("STMP_BIND_ADDR").unwrap_or("0.0.0.0:2525".to_string());
     let smtp_domain = env::var("SMTP_DOMAIN").context("env variable SMTP_DOMAIN not provided")?;
     let bucket: String =
