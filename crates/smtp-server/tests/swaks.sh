@@ -22,6 +22,12 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# Runs a command, showing its output only if it fails.
+quiet() {
+    local out
+    out=$("$@" 2>&1) || { printf '%s\n' "$out" >&2; return 1; }
+}
+
 echo "==> building examples/dump" >&2
 bin=$(cargo build --quiet --example dump --all-features --message-format=json |
     grep -o '"executable":"[^"]*/dump"' | tail -1 | sed -E 's/^"executable":"(.*)"$/\1/')
@@ -42,7 +48,7 @@ for p in "$port" "$tls_port"; do
 done
 
 echo "==> delivery with an attachment to alice@mx.example.org" >&2
-swaks --server "$host:$port" --from sender@example.org --to alice@mx.example.org \
+quiet swaks --server "$host:$port" --from sender@example.org --to alice@mx.example.org \
     --header "Subject: plain" --body "hello, plainly" \
     --attach-type text/plain --attach-name notes.txt --attach "attachment contents"
 msgdir="alice@mx.example.org/$(ls "alice@mx.example.org")"
@@ -51,14 +57,14 @@ test -f "$msgdir/body.txt"
 test -f "$msgdir/attachments/00-notes.txt"
 
 echo "==> STARTTLS delivery to bob@mx.example.org" >&2
-swaks --server "$host:$port" -tls --from sender@example.org --to bob@mx.example.org \
+quiet swaks --server "$host:$port" -tls --from sender@example.org --to bob@mx.example.org \
     --header "Subject: over tls" --body "hello, encrypted"
 msgdir="bob@mx.example.org/$(ls "bob@mx.example.org")"
 test -f "$msgdir/headers.txt"
 test -f "$msgdir/body.txt"
 
 echo "==> implicit TLS (tls-on-connect) delivery to dave@mx.example.org" >&2
-swaks --server "$host:$tls_port" --tls-on-connect --from sender@example.org --to dave@mx.example.org \
+quiet swaks --server "$host:$tls_port" --tls-on-connect --from sender@example.org --to dave@mx.example.org \
     --header "Subject: over implicit tls" --body "hello, encrypted from the first byte"
 msgdir="dave@mx.example.org/$(ls "dave@mx.example.org")"
 test -f "$msgdir/headers.txt"
@@ -69,7 +75,7 @@ csv_src=$(mktemp)
 bin_src=$(mktemp)
 printf 'name,qty,price\nwidget,3,9.99\ngadget,1,19.99\n' >"$csv_src"
 printf '\x00\x01\x02\x03\xff\xfe\x80\x81\r\n\r\n\x7f' >"$bin_src"
-swaks --server "$host:$port" --from sender@example.org --to carol@mx.example.org \
+quiet swaks --server "$host:$port" --from sender@example.org --to carol@mx.example.org \
     --header "Subject: attachments" --body "see attached" \
     --attach-type text/csv --attach-name data.csv --attach "@$csv_src" \
     --attach-type application/octet-stream --attach-name blob.bin --attach "@$bin_src"
@@ -82,7 +88,7 @@ rm -f "$csv_src" "$bin_src"
 
 echo "==> rejecting a recipient in a domain we don't serve" >&2
 if swaks --server "$host:$port" --from sender@example.org --to nobody@elsewhere.example \
-    --header "Subject: should bounce" --body "nope"; then
+    --header "Subject: should bounce" --body "nope" >/dev/null 2>&1; then
     echo "expected swaks to fail: server should reject the recipient" >&2
     exit 1
 fi
