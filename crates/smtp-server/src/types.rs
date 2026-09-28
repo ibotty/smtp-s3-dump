@@ -9,6 +9,7 @@ use std::num::NonZeroUsize;
 
 use smtp_proto::{MailFrom, RcptTo};
 
+use crate::Config;
 use crate::reply::Rejection;
 
 /// A validated DNS hostname: LDH labels, at most 253 bytes, no empty labels.
@@ -31,13 +32,20 @@ impl fmt::Display for InvalidHostname {
 }
 impl std::error::Error for InvalidHostname {}
 
+/// Whether `_` is accepted in hostname labels.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Underscore {
+    Reject,
+    Allow,
+}
+
 impl Hostname {
     /// Strict LDH hostname.
     pub fn new(s: &str) -> Result<Self, InvalidHostname> {
-        Self::parse(s, false)
+        Self::parse(s, Underscore::Reject)
     }
 
-    fn parse(s: &str, allow_underscore: bool) -> Result<Self, InvalidHostname> {
+    fn parse(s: &str, underscore: Underscore) -> Result<Self, InvalidHostname> {
         if s.is_empty() || s.len() > 253 {
             return Err(InvalidHostname("length must be 1..=253"));
         }
@@ -48,10 +56,11 @@ impl Hostname {
             if label.starts_with('-') || label.ends_with('-') {
                 return Err(InvalidHostname("label must not start/end with '-'"));
             }
-            if !label
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || (allow_underscore && b == b'_'))
-            {
+            if !label.bytes().all(|b| {
+                b.is_ascii_alphanumeric()
+                    || b == b'-'
+                    || (underscore == Underscore::Allow && b == b'_')
+            }) {
                 return Err(InvalidHostname(
                     "label must be LDH (letters, digits, hyphen)",
                 ));
@@ -92,19 +101,19 @@ impl fmt::Display for Domain {
 impl Domain {
     /// Mailbox domain: strict LDH hostname or RFC 5321 address literal.
     pub(crate) fn parse(s: &str) -> Result<Self, InvalidHostname> {
-        Self::parse_with(s, false)
+        Self::parse_with(s, Underscore::Reject)
     }
 
     /// Client-supplied EHLO/HELO domain: like [`Domain::parse`], but hostname
     /// labels may contain `_`.
     pub(crate) fn parse_client(s: &str) -> Result<Self, InvalidHostname> {
-        Self::parse_with(s, true)
+        Self::parse_with(s, Underscore::Allow)
     }
 
     /// Literals per RFC 5321 §4.1.3: `[a.b.c.d]` or `[IPv6:...]` only.
-    fn parse_with(s: &str, allow_underscore: bool) -> Result<Self, InvalidHostname> {
+    fn parse_with(s: &str, underscore: Underscore) -> Result<Self, InvalidHostname> {
         let Some(inner) = s.strip_prefix('[') else {
-            return Hostname::parse(s, allow_underscore).map(Domain::Name);
+            return Hostname::parse(s, underscore).map(Domain::Name);
         };
         let bad = || InvalidHostname("invalid address literal");
         let inner = inner.strip_suffix(']').ok_or_else(bad)?;
@@ -290,12 +299,7 @@ impl Sender {
         self.size
     }
 
-    pub(crate) fn from_smtp(
-        from: MailFrom<String>,
-        dsn_enabled: bool,
-        smtputf8_enabled: bool,
-        eightbitmime_enabled: bool,
-    ) -> Result<Self, Rejection> {
+    pub(crate) fn from_smtp(from: MailFrom<String>, cfg: &Config) -> Result<Self, Rejection> {
         let path = if from.address.is_empty() {
             ReversePath::Null
         } else {
@@ -305,17 +309,17 @@ impl Sender {
         const BODY: u64 = smtp_proto::MAIL_BODY_8BITMIME | smtp_proto::MAIL_BODY_BINARYMIME;
         const RET: u64 = smtp_proto::MAIL_RET_FULL | smtp_proto::MAIL_RET_HDRS;
         let body = from.flags & BODY;
-        if body == BODY || (body != 0 && !eightbitmime_enabled) {
+        if body == BODY || (body != 0 && !cfg.eightbitmime) {
             return Err(Rejection::unsupported_param("BODY"));
         }
-        if from.flags & smtp_proto::MAIL_SMTPUTF8 != 0 && !smtputf8_enabled {
+        if from.flags & smtp_proto::MAIL_SMTPUTF8 != 0 && !cfg.smtputf8 {
             return Err(Rejection::unsupported_param("SMTPUTF8"));
         }
         let ret = from.flags & RET;
-        if ret == RET || (ret != 0 && !dsn_enabled) {
+        if ret == RET || (ret != 0 && !cfg.dsn) {
             return Err(Rejection::unsupported_param("RET"));
         }
-        if from.env_id.is_some() && !dsn_enabled {
+        if from.env_id.is_some() && !cfg.dsn {
             return Err(Rejection::unsupported_param("ENVID"));
         }
 
@@ -338,7 +342,7 @@ impl Recipient {
         &self.path
     }
 
-    pub(crate) fn from_smtp(to: RcptTo<String>, dsn_enabled: bool) -> Result<Self, Rejection> {
+    pub(crate) fn from_smtp(to: RcptTo<String>, cfg: &Config) -> Result<Self, Rejection> {
         let path = if to.address.is_empty() {
             ForwardPath::Postmaster
         } else {
@@ -354,10 +358,10 @@ impl Recipient {
         if notify & NEVER != 0 && notify != NEVER {
             return Err(Rejection::invalid_notify());
         }
-        if notify != 0 && !dsn_enabled {
+        if notify != 0 && !cfg.dsn {
             return Err(Rejection::unsupported_param("NOTIFY"));
         }
-        if to.orcpt.is_some() && !dsn_enabled {
+        if to.orcpt.is_some() && !cfg.dsn {
             return Err(Rejection::unsupported_param("ORCPT"));
         }
 
@@ -435,6 +439,10 @@ impl MessageSize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_cfg() -> Config {
+        Config::new(Hostname::new("mx.example.org").unwrap())
+    }
 
     #[test]
     fn hostname_accepts_ldh() {
@@ -568,7 +576,7 @@ mod tests {
             address: String::new(),
             ..Default::default()
         };
-        let sender = Sender::from_smtp(from, false, false, false).unwrap();
+        let sender = Sender::from_smtp(from, &test_cfg()).unwrap();
         assert_eq!(sender.path(), &ReversePath::Null);
     }
 
@@ -578,7 +586,7 @@ mod tests {
             address: String::new(),
             ..Default::default()
         };
-        let rcpt = Recipient::from_smtp(to, false).unwrap();
+        let rcpt = Recipient::from_smtp(to, &test_cfg()).unwrap();
         assert_eq!(rcpt.path(), &ForwardPath::Postmaster);
     }
 
@@ -589,7 +597,7 @@ mod tests {
             flags: smtp_proto::RCPT_NOTIFY_NEVER | smtp_proto::RCPT_NOTIFY_SUCCESS,
             ..Default::default()
         };
-        assert!(Recipient::from_smtp(to, false).is_err());
+        assert!(Recipient::from_smtp(to, &test_cfg()).is_err());
     }
 
     #[test]

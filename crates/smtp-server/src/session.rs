@@ -494,7 +494,7 @@ fn hello<T: Transport>(mut session: Session<T>, host: &str, kind: Greeting) -> D
             let req = EhloRequest {
                 session,
                 host,
-                kind,
+                ehlo: matches!(kind, Greeting::Ehlo),
             };
             Dispatch::Stop(Poll::Event(match kind {
                 Greeting::Ehlo => Event::Ehlo(req),
@@ -523,12 +523,7 @@ fn dispatch<T: Transport>(mut session: Session<T>, req: Request<String>) -> Disp
                 ));
                 return Dispatch::Continue(session);
             }
-            match Sender::from_smtp(
-                from,
-                session.cfg.dsn,
-                session.cfg.smtputf8,
-                session.cfg.eightbitmime,
-            ) {
+            match Sender::from_smtp(from, &session.cfg) {
                 Ok(sender) => {
                     if let (Some(limit), Some(size)) = (session.cfg.max_message_size, sender.size())
                         && size.get() > limit.get()
@@ -555,7 +550,7 @@ fn dispatch<T: Transport>(mut session: Session<T>, req: Request<String>) -> Disp
                 session.push_reply(&Rejection::too_many_rcpts());
                 return Dispatch::Continue(session);
             }
-            match Recipient::from_smtp(to, session.cfg.dsn) {
+            match Recipient::from_smtp(to, &session.cfg) {
                 Ok(recipient) => {
                     Dispatch::Stop(Poll::Event(Event::Rcpt(RcptRequest { session, recipient })))
                 }
@@ -680,7 +675,7 @@ decide!(
 pub struct EhloRequest<T: Transport> {
     session: Session<T>,
     host: Domain,
-    kind: Greeting,
+    ehlo: bool,
 }
 
 /// `HELO` request; the same type as [`EhloRequest`].
@@ -694,14 +689,11 @@ impl<T: Transport> EhloRequest<T> {
 
     /// Accepts the EHLO (advertises capabilities) or HELO, (re)starting the transaction.
     pub fn accept(mut self) -> Session<T> {
-        match self.kind {
-            Greeting::Ehlo => {
-                let ehlo = self.session.ehlo_response();
-                self.session.output.extend_from_slice(&ehlo);
-            }
-            Greeting::Helo => {
-                let _ = write!(self.session.output, "250 {}\r\n", self.session.cfg.hostname);
-            }
+        if self.ehlo {
+            let ehlo = self.session.ehlo_response();
+            self.session.output.extend_from_slice(&ehlo);
+        } else {
+            let _ = write!(self.session.output, "250 {}\r\n", self.session.cfg.hostname);
         }
         self.session.phase = Phase::Greeted;
         self.session
