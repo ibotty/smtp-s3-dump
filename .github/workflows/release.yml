@@ -54,6 +54,7 @@ jobs:
   github-release:
     name: Create GitHub release
     needs: build
+    if: ${{ !cancelled() && !failure() }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -82,6 +83,7 @@ jobs:
   container:
     name: Build and push container
     needs: build
+    if: ${{ !cancelled() && !failure() }}
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
