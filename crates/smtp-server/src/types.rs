@@ -273,46 +273,12 @@ impl fmt::Display for ForwardPath {
     }
 }
 
-/// `BODY=` parameter of `MAIL FROM`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Body {
-    SevenBit,
-    EightBitMime,
-    BinaryMime,
-}
-
-/// `RET=` parameter of `MAIL FROM` (RFC 3461 DSN).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Ret {
-    Full,
-    Headers,
-}
-
-/// xtext-decoded `ENVID=` parameter.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EnvId(String);
-
-impl EnvId {
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for EnvId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-/// A validated `MAIL FROM` transaction.
+/// A validated `MAIL FROM` transaction. `BODY=`, `SMTPUTF8`, `RET=` and `ENVID=` are checked
+/// against the enabled extensions but not retained.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Sender {
     path: ReversePath,
     size: Option<NonZeroUsize>,
-    body: Body,
-    ret: Option<Ret>,
-    env_id: Option<EnvId>,
-    smtputf8: bool,
 }
 
 impl Sender {
@@ -322,22 +288,6 @@ impl Sender {
 
     pub fn size(&self) -> Option<NonZeroUsize> {
         self.size
-    }
-
-    pub fn body(&self) -> Body {
-        self.body
-    }
-
-    pub fn ret(&self) -> Option<Ret> {
-        self.ret
-    }
-
-    pub fn env_id(&self) -> Option<&EnvId> {
-        self.env_id.as_ref()
-    }
-
-    pub fn smtputf8(&self) -> bool {
-        self.smtputf8
     }
 
     pub(crate) fn from_smtp(
@@ -352,99 +302,40 @@ impl Sender {
             ReversePath::Mailbox(Mailbox::parse(&from.address)?)
         };
 
-        let body = match from.flags
-            & (smtp_proto::MAIL_BODY_8BITMIME | smtp_proto::MAIL_BODY_BINARYMIME)
-        {
-            0 => Body::SevenBit,
-            f if f == smtp_proto::MAIL_BODY_8BITMIME => Body::EightBitMime,
-            f if f == smtp_proto::MAIL_BODY_BINARYMIME => Body::BinaryMime,
-            _ => return Err(Rejection::unsupported_param("BODY")),
-        };
-        if body != Body::SevenBit && !eightbitmime_enabled {
+        const BODY: u64 = smtp_proto::MAIL_BODY_8BITMIME | smtp_proto::MAIL_BODY_BINARYMIME;
+        const RET: u64 = smtp_proto::MAIL_RET_FULL | smtp_proto::MAIL_RET_HDRS;
+        let body = from.flags & BODY;
+        if body == BODY || (body != 0 && !eightbitmime_enabled) {
             return Err(Rejection::unsupported_param("BODY"));
         }
-
-        let smtputf8 = from.flags & smtp_proto::MAIL_SMTPUTF8 != 0;
-        if smtputf8 && !smtputf8_enabled {
+        if from.flags & smtp_proto::MAIL_SMTPUTF8 != 0 && !smtputf8_enabled {
             return Err(Rejection::unsupported_param("SMTPUTF8"));
         }
-
-        let ret = match from.flags & (smtp_proto::MAIL_RET_FULL | smtp_proto::MAIL_RET_HDRS) {
-            0 => None,
-            f if f == smtp_proto::MAIL_RET_FULL => Some(Ret::Full),
-            f if f == smtp_proto::MAIL_RET_HDRS => Some(Ret::Headers),
-            _ => return Err(Rejection::unsupported_param("RET")),
-        };
-        if ret.is_some() && !dsn_enabled {
+        let ret = from.flags & RET;
+        if ret == RET || (ret != 0 && !dsn_enabled) {
             return Err(Rejection::unsupported_param("RET"));
         }
-
-        let env_id = match from.env_id {
-            Some(raw) if dsn_enabled => Some(EnvId(xtext_decode(&raw)?)),
-            Some(_) => return Err(Rejection::unsupported_param("ENVID")),
-            None => None,
-        };
+        if from.env_id.is_some() && !dsn_enabled {
+            return Err(Rejection::unsupported_param("ENVID"));
+        }
 
         Ok(Sender {
             path,
             size: NonZeroUsize::new(from.size),
-            body,
-            ret,
-            env_id,
-            smtputf8,
         })
     }
 }
 
-/// `NOTIFY=` parameter of `RCPT TO` (RFC 3461 DSN). `NEVER` combined with any
-/// other keyword, or `SUCCESS,FAILURE,DELAY` all disabled, is unrepresentable.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Notify {
-    Default,
-    Never,
-    On {
-        success: bool,
-        failure: bool,
-        delay: bool,
-    },
-}
-
-/// xtext-decoded `ORCPT=` parameter: `addr-type;xtext-addr`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OriginalRecipient {
-    addr_type: String,
-    addr: String,
-}
-
-impl OriginalRecipient {
-    pub fn addr_type(&self) -> &str {
-        &self.addr_type
-    }
-
-    pub fn addr(&self) -> &str {
-        &self.addr
-    }
-}
-
-/// A validated `RCPT TO` recipient.
+/// A validated `RCPT TO` recipient. `NOTIFY=` and `ORCPT=` are checked against the enabled
+/// extensions but not retained.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Recipient {
     path: ForwardPath,
-    notify: Notify,
-    orcpt: Option<OriginalRecipient>,
 }
 
 impl Recipient {
     pub fn path(&self) -> &ForwardPath {
         &self.path
-    }
-
-    pub fn notify(&self) -> Notify {
-        self.notify
-    }
-
-    pub fn orcpt(&self) -> Option<&OriginalRecipient> {
-        self.orcpt.as_ref()
     }
 
     pub(crate) fn from_smtp(to: RcptTo<String>, dsn_enabled: bool) -> Result<Self, Rejection> {
@@ -454,75 +345,24 @@ impl Recipient {
             ForwardPath::Mailbox(Mailbox::parse(&to.address)?)
         };
 
+        const NEVER: u64 = smtp_proto::RCPT_NOTIFY_NEVER;
         const ALL: u64 = smtp_proto::RCPT_NOTIFY_SUCCESS
             | smtp_proto::RCPT_NOTIFY_FAILURE
             | smtp_proto::RCPT_NOTIFY_DELAY
-            | smtp_proto::RCPT_NOTIFY_NEVER;
-        let notify_flags = to.flags & ALL;
-        let notify = if notify_flags == 0 {
-            Notify::Default
-        } else if notify_flags == smtp_proto::RCPT_NOTIFY_NEVER {
-            Notify::Never
-        } else if notify_flags & smtp_proto::RCPT_NOTIFY_NEVER != 0 {
+            | NEVER;
+        let notify = to.flags & ALL;
+        if notify & NEVER != 0 && notify != NEVER {
             return Err(Rejection::invalid_notify());
-        } else {
-            let success = notify_flags & smtp_proto::RCPT_NOTIFY_SUCCESS != 0;
-            let failure = notify_flags & smtp_proto::RCPT_NOTIFY_FAILURE != 0;
-            let delay = notify_flags & smtp_proto::RCPT_NOTIFY_DELAY != 0;
-            Notify::On {
-                success,
-                failure,
-                delay,
-            }
-        };
-        if !matches!(notify, Notify::Default) && !dsn_enabled {
+        }
+        if notify != 0 && !dsn_enabled {
             return Err(Rejection::unsupported_param("NOTIFY"));
         }
-
-        let orcpt = match to.orcpt {
-            Some(raw) if dsn_enabled => Some(parse_orcpt(&raw)?),
-            Some(_) => return Err(Rejection::unsupported_param("ORCPT")),
-            None => None,
-        };
-
-        Ok(Recipient {
-            path,
-            notify,
-            orcpt,
-        })
-    }
-}
-
-fn parse_orcpt(raw: &str) -> Result<OriginalRecipient, Rejection> {
-    let (addr_type, addr) = raw
-        .split_once(';')
-        .ok_or_else(|| Rejection::unsupported_param("ORCPT"))?;
-    Ok(OriginalRecipient {
-        addr_type: addr_type.to_owned(),
-        addr: xtext_decode(addr)?,
-    })
-}
-
-/// RFC 3461 xtext decoding: `+HH` is a hex-escaped byte, everything else is literal.
-fn xtext_decode(s: &str) -> Result<String, Rejection> {
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'+' {
-            let hex = bytes
-                .get(i + 1..i + 3)
-                .and_then(|h| std::str::from_utf8(h).ok())
-                .and_then(|h| u8::from_str_radix(h, 16).ok())
-                .ok_or_else(|| Rejection::unsupported_param("xtext"))?;
-            out.push(hex);
-            i += 3;
-        } else {
-            out.push(bytes[i]);
-            i += 1;
+        if to.orcpt.is_some() && !dsn_enabled {
+            return Err(Rejection::unsupported_param("ORCPT"));
         }
+
+        Ok(Recipient { path })
     }
-    String::from_utf8(out).map_err(|_| Rejection::unsupported_param("xtext"))
 }
 
 /// A non-empty, singly-growable list. `RCPT` guarantees at least one recipient.
@@ -542,10 +382,6 @@ impl<T> NonEmpty<T> {
 
     pub fn push(&mut self, item: T) {
         self.rest.push(item);
-    }
-
-    pub fn first(&self) -> &T {
-        &self.first
     }
 
     pub fn len(&self) -> NonZeroUsize {
