@@ -1,0 +1,18 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended", "helpers:pinGitHubActionDigestsToSemver", "security:openssf-scorecard"],
+  "lockFileMaintenance": { "enabled": true, "automerge": true },
+  "minimumReleaseAge": "7 days",
+  "packageRules": [
+    {
+      "matchManagers": ["github-actions"],
+      "groupName": "github actions",
+      "separateMajorMinor": false
+    },
+    {
+      "matchManagers": ["cargo"],
+      "groupName": "cargo dependencies",
+      "separateMajorMinor": false
+    }
+  ]
+}
