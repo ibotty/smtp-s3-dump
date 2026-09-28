@@ -13,7 +13,23 @@ permissions:
   contents: read
 
 jobs:
+  check-ci:
+    name: Look for a passing CI run
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+    outputs:
+      passed: ${{ steps.runs.outputs.passed }}
+    steps:
+    - id: runs
+      run: |
+        echo "passed=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow ci.yml --commit "$GITHUB_SHA" --status success --json databaseId,event --jq '[.[] | select(.event != "schedule")] | length')" >> "$GITHUB_OUTPUT"
+      env:
+        GH_TOKEN: ${{ github.token }}
+
   ci:
+    needs: check-ci
+    if: ${{ needs.check-ci.outputs.passed == '0' }}
     permissions:
       contents: read
       checks: write
@@ -21,7 +37,8 @@ jobs:
 
   build:
     name: Build release binary
-    needs: ci
+    needs: [check-ci, ci]
+    if: ${{ !cancelled() && !failure() }}
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
