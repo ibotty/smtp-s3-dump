@@ -2,6 +2,7 @@
 //! [`Session::poll`]. No I/O happens here; see [`crate::serve`] for a driver.
 
 use std::convert::Infallible;
+use std::io::Write;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
@@ -481,22 +482,32 @@ enum Dispatch<T: Transport> {
     Stop(Poll<T>),
 }
 
+fn hello<T: Transport>(mut session: Session<T>, host: &str, ehlo: bool) -> Dispatch<T> {
+    match Domain::parse_client(host) {
+        Ok(host) => {
+            let req = EhloRequest {
+                session,
+                host,
+                ehlo,
+            };
+            Dispatch::Stop(Poll::Event(if ehlo {
+                Event::Ehlo(req)
+            } else {
+                Event::Helo(req)
+            }))
+        }
+        Err(_) => {
+            let name = if ehlo { "EHLO" } else { "HELO" };
+            session.push_reply(&Rejection::syntax_error(format!("invalid {name} domain")));
+            Dispatch::Continue(session)
+        }
+    }
+}
+
 fn dispatch<T: Transport>(mut session: Session<T>, req: Request<String>) -> Dispatch<T> {
     match req {
-        Request::Ehlo { host } | Request::Lhlo { host } => match Domain::parse_client(&host) {
-            Ok(host) => Dispatch::Stop(Poll::Event(Event::Ehlo(EhloRequest { session, host }))),
-            Err(_) => {
-                session.push_reply(&Rejection::syntax_error("invalid EHLO domain"));
-                Dispatch::Continue(session)
-            }
-        },
-        Request::Helo { host } => match Domain::parse_client(&host) {
-            Ok(host) => Dispatch::Stop(Poll::Event(Event::Helo(HeloRequest { session, host }))),
-            Err(_) => {
-                session.push_reply(&Rejection::syntax_error("invalid HELO domain"));
-                Dispatch::Continue(session)
-            }
-        },
+        Request::Ehlo { host } | Request::Lhlo { host } => hello(session, &host, true),
+        Request::Helo { host } => hello(session, &host, false),
         Request::Mail { from } => {
             if !matches!(session.phase, Phase::Greeted) {
                 session.push_reply(&Rejection::bad_sequence(
@@ -651,18 +662,21 @@ macro_rules! decide {
 }
 decide!(
     EhloRequest,
-    HeloRequest,
     MailRequest,
     RcptRequest,
     DataStartRequest,
     DataChunkRequest
 );
 
-/// `EHLO` request; decide whether to accept it.
+/// `EHLO` (or `HELO`) request; decide whether to accept it.
 pub struct EhloRequest<T: Transport> {
     session: Session<T>,
     host: Domain,
+    ehlo: bool,
 }
+
+/// `HELO` request; the same type as [`EhloRequest`].
+pub type HeloRequest<T> = EhloRequest<T>;
 
 impl<T: Transport> EhloRequest<T> {
     /// The peer-supplied domain (hostname or address literal).
@@ -670,42 +684,19 @@ impl<T: Transport> EhloRequest<T> {
         &self.host
     }
 
-    /// Accepts the EHLO: advertises capabilities, (re)starts the transaction.
+    /// Accepts the EHLO (advertises capabilities) or HELO, (re)starting the transaction.
     pub fn accept(mut self) -> Session<T> {
-        let ehlo = self.session.ehlo_response();
-        self.session.output.extend_from_slice(&ehlo);
+        if self.ehlo {
+            let ehlo = self.session.ehlo_response();
+            self.session.output.extend_from_slice(&ehlo);
+        } else {
+            let _ = write!(self.session.output, "250 {}\r\n", self.session.cfg.hostname);
+        }
         self.session.phase = Phase::Greeted;
         self.session
     }
 
-    /// Rejects the EHLO; any transaction already in progress is left untouched.
-    pub fn reject(mut self, r: Rejection) -> Session<T> {
-        self.session.reject_keep_phase(&r);
-        self.session
-    }
-}
-
-/// `HELO` request; decide whether to accept it.
-pub struct HeloRequest<T: Transport> {
-    session: Session<T>,
-    host: Domain,
-}
-
-impl<T: Transport> HeloRequest<T> {
-    /// The peer-supplied domain (hostname or address literal).
-    pub fn host(&self) -> &Domain {
-        &self.host
-    }
-
-    /// Accepts the HELO.
-    pub fn accept(mut self) -> Session<T> {
-        use std::io::Write;
-        let _ = write!(self.session.output, "250 {}\r\n", self.session.cfg.hostname);
-        self.session.phase = Phase::Greeted;
-        self.session
-    }
-
-    /// Rejects the HELO; any transaction already in progress is left untouched.
+    /// Rejects the request; any transaction already in progress is left untouched.
     pub fn reject(mut self, r: Rejection) -> Session<T> {
         self.session.reject_keep_phase(&r);
         self.session
