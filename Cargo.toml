@@ -1,6 +1,3 @@
-[workspace]
-members = [".", "crates/smtp-server"]
-
 [package]
 name = "smtp-s3-dump"
 version = "0.2.2"
