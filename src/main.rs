@@ -54,7 +54,7 @@ async fn main() -> Result<()> {
         .map(|s| s == "true")
         .unwrap_or(false);
 
-    let shutdown = tokio_graceful::Shutdown::default();
+    // let shutdown = tokio_graceful::Shutdown::default();
     // shutdown.spawn_task_fn(|guard| notify::watch_certs(resolver.clone(), guard));
 
     let resolver = tls::CertificateResolver::new(&cert_path, &key_path)?;
