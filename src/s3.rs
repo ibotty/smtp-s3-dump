@@ -1,10 +1,8 @@
-use std::collections::HashMap;
-
 use anyhow::{Context, Result};
 use aws_sdk_s3::primitives::ByteStream;
 use futures::future::try_join_all;
 use mail_parser::{Message, MessagePart, MimeHeaders};
-use serde_json::json;
+use serde_json::{json, Map, Value};
 use sqlx::PgPool;
 use tracing::{debug, instrument};
 
@@ -24,7 +22,13 @@ pub async fn upload_message(
 
     let message_id = message.message_id().context("mail has no message id")?;
     let date = message.date().context("mail has no date")?.to_rfc3339();
-    let base_path = format!("{}/{}/{}-{}/", rcpt.to_lowercase(), from, date, message_id);
+    let base_path = format!(
+        "{}/{}/{}-{}/",
+        sanitize_key_component(&rcpt.to_lowercase()),
+        sanitize_key_component(from),
+        sanitize_key_component(&date),
+        sanitize_key_component(message_id),
+    );
 
     let s3_client = aws_sdk_s3::Client::from_conf(s3_config.clone());
 
@@ -55,9 +59,8 @@ pub async fn upload_message(
         })
         .collect::<Result<Vec<_>>>()?;
 
-    let headers_map: HashMap<&str, &str> =
-        message.headers_raw().map(|(k, v)| (k, v.trim())).collect();
-    let headers_json = serde_json::to_vec_pretty(&headers_map)?;
+    let headers_value = headers_to_json(message.headers_raw());
+    let headers_json = serde_json::to_vec_pretty(&headers_value)?;
     let headers_path = format!("{}headers.json", base_path);
     uploads.push(upload_file(
         &s3_client,
@@ -110,11 +113,30 @@ pub async fn upload_message(
             .and_then(MessagePart::text_contents)
             .unwrap_or("")
             .trim(),
-        serde_json::to_value(headers_map)?,
+        headers_value,
         serde_json::to_value(attachments_metadata)?,
     )
     .await?;
     Ok(())
+}
+
+/// Headers as a JSON object of `name -> value`. A header that occurs once stays a plain string
+/// (backward compatible); one that occurs several times becomes an array of all its values in
+/// message order, so nothing (e.g. a `Received` chain) is silently dropped. Cross-name order is
+/// not kept (serde_json objects are sorted).
+fn headers_to_json<'a>(headers: impl Iterator<Item = (&'a str, &'a str)>) -> Value {
+    let mut map = Map::new();
+    for (k, v) in headers {
+        let v = Value::String(v.trim().to_string());
+        match map.get_mut(k) {
+            None => {
+                map.insert(k.to_string(), v);
+            }
+            Some(Value::Array(a)) => a.push(v),
+            Some(old) => *old = Value::Array(vec![old.take(), v]),
+        }
+    }
+    Value::Object(map)
 }
 
 fn content_type_from_path(path: &str) -> Option<String> {
@@ -130,16 +152,40 @@ fn content_type(path: &str, part_type: Option<String>) -> Option<String> {
 /// dots and strips leading ones (so no `..` or hidden files), falls back to `attachment`.
 /// Single dots are kept, since the extension drives the guessed content type.
 fn sanitize_filename(name: &str) -> String {
-    let mut out = String::with_capacity(name.len());
-    for c in name.chars().filter(|c| !matches!(c, '/' | '\\')) {
+    let out = collapse_dots(name.chars().filter(|c| !is_unsafe_key_char(*c)));
+    if out.is_empty() {
+        "attachment".to_string()
+    } else {
+        out
+    }
+}
+
+fn is_unsafe_key_char(c: char) -> bool {
+    matches!(c, '/' | '\\') || c.is_control()
+}
+
+/// Collapses runs of dots, strips leading ones and trims whitespace.
+fn collapse_dots(chars: impl Iterator<Item = char>) -> String {
+    let mut out = String::new();
+    for c in chars {
         if c == '.' && (out.is_empty() || out.ends_with('.')) {
             continue;
         }
         out.push(c);
     }
-    let out = out.trim().to_string();
+    out.trim().to_string()
+}
+
+/// Makes an attacker-controlled value (recipient, sender, Message-ID) safe as part of an S3 key:
+/// `/`, `\\` and control characters (incl. NUL) become `_`, so it can never add path segments,
+/// and dot runs are collapsed so no `..` survives. Falls back to `unknown` if nothing is left.
+fn sanitize_key_component(s: &str) -> String {
+    let out = collapse_dots(
+        s.chars()
+            .map(|c| if is_unsafe_key_char(c) { '_' } else { c }),
+    );
     if out.is_empty() {
-        "attachment".to_string()
+        "unknown".to_string()
     } else {
         out
     }
@@ -174,7 +220,8 @@ async fn upload_file(
 
 #[cfg(test)]
 mod tests {
-    use super::{content_type, sanitize_filename};
+    use super::{content_type, headers_to_json, sanitize_filename, sanitize_key_component};
+    use serde_json::json;
 
     #[test]
     fn content_type_prefers_extension_then_part_type() {
@@ -188,6 +235,58 @@ mod tests {
             Some("application/x-custom")
         );
         assert_eq!(content_type("k/00-attachment", None), None);
+        assert_eq!(
+            content_type("k/00-a.png", None).as_deref(),
+            Some("image/png")
+        );
+    }
+
+    #[test]
+    fn sanitizes_key_components() {
+        for (input, want) in [
+            ("alice@example.org", "alice@example.org"),
+            ("john.smith@example.org", "john.smith@example.org"),
+            ("<abc.123@mail.example.org>", "<abc.123@mail.example.org>"),
+            ("../../etc/passwd", "_._etc_passwd"),
+            ("a/../b", "a_._b"),
+            ("..", "unknown"),
+            ("/", "_"),
+            ("a\\b", "a_b"),
+            ("\"../x/y\"@evil.org", "\"._x_y\"@evil.org"),
+            ("a\0b\r\nc\x1b", "a_b__c_"),
+            ("", "unknown"),
+            ("   ", "unknown"),
+            ("\0", "_"),
+        ] {
+            let got = sanitize_key_component(input);
+            assert_eq!(got, want, "input {input:?}");
+            assert!(!got.contains('/') && !got.contains(".."), "{got:?}");
+            assert!(!got.chars().any(char::is_control), "{got:?}");
+        }
+    }
+
+    #[test]
+    fn filenames_drop_control_chars() {
+        assert_eq!(sanitize_filename("a\0b\n.txt"), "ab.txt");
+    }
+
+    #[test]
+    fn duplicate_headers_are_preserved() {
+        let raw = [
+            ("Subject", " hi\r\n"),
+            ("Received", " from a"),
+            ("Message-ID", " <1@x>"),
+            ("Received", " from b"),
+            ("Received", " from c"),
+        ];
+        assert_eq!(
+            headers_to_json(raw.into_iter()),
+            json!({
+                "Subject": "hi",
+                "Message-ID": "<1@x>",
+                "Received": ["from a", "from b", "from c"],
+            })
+        );
     }
 
     #[test]
