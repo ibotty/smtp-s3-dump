@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Integration test for examples/dump.rs, driven over a real TCP socket with `swaks`
-# (https://www.jetmore.org/john/code/swaks/): STARTTLS, mail-parser part explosion, exact
+# (https://www.jetmore.org/john/code/swaks/): STARTTLS, implicit TLS, mail-parser part explosion, exact
 # byte-for-byte roundtrip of csv/binary attachments, and recipient rejection. Run directly
 # (`bash tests/swaks.sh`, from anywhere) or via `cargo test --test swaks`, which execs this
 # script and skips it if `swaks` isn't installed.
@@ -9,6 +9,7 @@ cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 host=127.0.0.1
 port=2525
+tls_port=4650
 server_pid=
 csv_src=
 bin_src=
@@ -17,7 +18,7 @@ cleanup() {
     [[ -n "$server_pid" ]] && kill "$server_pid" 2>/dev/null
     [[ -n "$csv_src" ]] && rm -f "$csv_src"
     [[ -n "$bin_src" ]] && rm -f "$bin_src"
-    rm -rf "alice@mx.example.org" "bob@mx.example.org" "carol@mx.example.org"
+    rm -rf "alice@mx.example.org" "bob@mx.example.org" "carol@mx.example.org" "dave@mx.example.org"
 }
 trap cleanup EXIT
 
@@ -29,13 +30,16 @@ bin=$(cargo build --quiet --example dump --all-features --message-format=json |
 "$bin" &
 server_pid=$!
 
-echo "==> waiting for $host:$port" >&2
-for _ in $(seq 1 50); do
-    { exec 3<>"/dev/tcp/$host/$port"; } 2>/dev/null && { exec 3>&-; break; }
-    sleep 0.1
+# Only probes the port: the implicit-TLS listener just sees a connect + close (failed handshake).
+for p in "$port" "$tls_port"; do
+    echo "==> waiting for $host:$p" >&2
+    for _ in $(seq 1 50); do
+        { exec 3<>"/dev/tcp/$host/$p"; } 2>/dev/null && { exec 3>&-; break; }
+        sleep 0.1
+    done
+    { exec 3<>"/dev/tcp/$host/$p"; } 2>/dev/null || { echo "server never started listening on $p" >&2; exit 1; }
+    exec 3>&-
 done
-{ exec 3<>"/dev/tcp/$host/$port"; } 2>/dev/null || { echo "server never started listening" >&2; exit 1; }
-exec 3>&-
 
 echo "==> delivery with an attachment to alice@mx.example.org" >&2
 swaks --server "$host:$port" --from sender@example.org --to alice@mx.example.org \
@@ -50,6 +54,13 @@ echo "==> STARTTLS delivery to bob@mx.example.org" >&2
 swaks --server "$host:$port" -tls --from sender@example.org --to bob@mx.example.org \
     --header "Subject: over tls" --body "hello, encrypted"
 msgdir="bob@mx.example.org/$(ls "bob@mx.example.org")"
+test -f "$msgdir/headers.txt"
+test -f "$msgdir/body.txt"
+
+echo "==> implicit TLS (tls-on-connect) delivery to dave@mx.example.org" >&2
+swaks --server "$host:$tls_port" --tls-on-connect --from sender@example.org --to dave@mx.example.org \
+    --header "Subject: over implicit tls" --body "hello, encrypted from the first byte"
+msgdir="dave@mx.example.org/$(ls "dave@mx.example.org")"
 test -f "$msgdir/headers.txt"
 test -f "$msgdir/body.txt"
 

@@ -103,9 +103,36 @@ async fn main() -> io::Result<()> {
     let hostname = Hostname::new("mx.example.org").expect("valid hostname");
     let cfg = Arc::new(Config::new(hostname.clone()));
     let acceptor = TlsAcceptor::from(Arc::new(load_tls_config()?));
-    let listener = TcpListener::bind("[::]:2525").await?;
     // Buffered mode holds up to max_message_size per connection: bound concurrency.
     let slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+    // 2525: plaintext with STARTTLS on offer; 4650: implicit TLS (SMTPS-style).
+    tokio::try_join!(
+        listen(
+            "[::]:2525",
+            TlsMode::StartTls(acceptor.clone()),
+            &cfg,
+            &hostname,
+            &slots
+        ),
+        listen(
+            "[::]:4650",
+            TlsMode::Implicit(acceptor),
+            &cfg,
+            &hostname,
+            &slots
+        ),
+    )
+    .map(|_| ())
+}
+
+async fn listen(
+    addr: &str,
+    tls: TlsMode,
+    cfg: &Arc<Config>,
+    hostname: &Hostname,
+    slots: &Arc<Semaphore>,
+) -> io::Result<()> {
+    let listener = TcpListener::bind(addr).await?;
     loop {
         let permit = slots
             .clone()
@@ -113,16 +140,12 @@ async fn main() -> io::Result<()> {
             .await
             .expect("semaphore never closed");
         let (socket, peer) = listener.accept().await?;
-        let cfg = cfg.clone();
-        let acceptor = acceptor.clone();
+        let (cfg, tls) = (cfg.clone(), tls.clone());
         let mut handler = Dump {
             domain: Domain::Name(hostname.clone()),
         };
         tokio::spawn(async move {
-            if let Err(e) =
-                smtp_server::serve(socket, &mut handler, cfg, TlsMode::StartTls(acceptor), None)
-                    .await
-            {
+            if let Err(e) = smtp_server::serve(socket, &mut handler, cfg, tls, None).await {
                 eprintln!("{peer}: {e}");
             }
             drop(permit);
