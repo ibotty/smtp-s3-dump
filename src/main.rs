@@ -12,10 +12,12 @@ use tokio::signal::unix::{signal, SignalKind};
 use tokio_rustls::TlsAcceptor;
 use tracing::instrument;
 use tracing::{debug, error, info, warn};
+use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 use crate::smtp::{SmtpBackend, SmtpSession};
 
+mod attachment;
 mod db;
 mod notify;
 mod s3;
@@ -27,7 +29,7 @@ mod tls;
 async fn main() -> Result<()> {
     // install global default tracing subscriber using RUST_LOG env variable
     tracing_subscriber::registry()
-        .with(fmt::layer())
+        .with(fmt::layer().with_span_events(FmtSpan::NEW))
         .with(EnvFilter::from_default_env())
         .init();
 
@@ -51,6 +53,9 @@ async fn main() -> Result<()> {
     let check_db: bool = env::var("CHECK_ALLOWED_IN_DB")
         .map(|s| s == "true")
         .unwrap_or(false);
+
+    let shutdown = tokio_graceful::Shutdown::default();
+    // shutdown.spawn_task_fn(|guard| notify::watch_certs(resolver.clone(), guard));
 
     let resolver = tls::CertificateResolver::new(&cert_path, &key_path)?;
     // start certificate change watcher

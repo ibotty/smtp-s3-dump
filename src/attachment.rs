@@ -1,0 +1,156 @@
+//! Byte-preserving extraction of e-mail attachments.
+//!
+//! `mail-parser` classifies any `Content-Type: text/*` MIME part as `PartType::Text`,
+//! decoding it into a UTF-8 `String` while parsing (see `mail_parser::parsers::message`).
+//! That's correct for message bodies, but wrong for attachments such as CSV files:
+//!
+//! - quoted-printable decoding canonicalizes line breaks to CRLF, even when the
+//!   original attachment only used LF,
+//! - a missing/unrecognized `charset` falls back to `String::from_utf8_lossy`,
+//!   replacing every non-UTF-8 byte (e.g. Latin-1 'ä' = 0xE4) with U+FFFD,
+//! - and `MessagePart::contents()` always returns the decoded string re-encoded as
+//!   UTF-8, so even a successfully-decoded charset (e.g. UTF-16LE) loses its BOM and
+//!   its original encoding entirely.
+//!
+//! The tests below pin down this behavior with minimal fixtures built by hand
+//! (`MessageParser`, no S3/DB involved). The byte-preserving replacement for
+//! `MessagePart::contents()` -- slicing `raw_message` by `offset_body`/`offset_end`
+//! and undoing only `Encoding::{Base64,QuotedPrintable}` -- will be added to this
+//! module next, called from `s3::upload_message` instead of `.contents()`.
+
+#[cfg(test)]
+mod tests {
+    use mail_parser::MessageParser;
+
+    fn build_eml(content_type: &str, cte: &str, body: &[u8]) -> Vec<u8> {
+        let mut eml = format!(
+            "From: a@example.com\r\n\
+             Date: Mon, 1 Jan 2024 00:00:00 +0000\r\n\
+             Message-ID: <1@example.com>\r\n\
+             Mime-Version: 1.0\r\n\
+             Content-Type: multipart/mixed; boundary=\"BOUNDARY\"\r\n\
+             \r\n\
+             --BOUNDARY\r\n\
+             Content-Type: text/plain\r\n\
+             \r\n\
+             body\r\n\
+             --BOUNDARY\r\n\
+             Content-Type: {content_type}\r\n\
+             Content-Disposition: attachment; filename=\"data.csv\"\r\n\
+             Content-Transfer-Encoding: {cte}\r\n\
+             \r\n"
+        )
+        .into_bytes();
+        eml.extend_from_slice(body);
+        eml.extend_from_slice(b"\r\n--BOUNDARY--\r\n");
+        eml
+    }
+
+    fn first_attachment_bytes(eml: &[u8]) -> Vec<u8> {
+        let message = MessageParser::default()
+            .parse(eml)
+            .expect("fixture message must parse");
+        let bytes = message
+            .attachments()
+            .next()
+            .expect("fixture message must have an attachment")
+            .contents()
+            .to_vec();
+        bytes
+    }
+
+    fn utf16le_with_bom(s: &str) -> Vec<u8> {
+        let mut out = vec![0xFF, 0xFE];
+        for unit in s.encode_utf16() {
+            out.extend_from_slice(&unit.to_le_bytes());
+        }
+        out
+    }
+
+    /// Minimal RFC 4648 base64 encoder, just so tests can build a realistic
+    /// `Content-Transfer-Encoding: base64` fixture without adding a dependency.
+    fn base64_encode(bytes: &[u8]) -> String {
+        const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        for chunk in bytes.chunks(3) {
+            let b0 = chunk[0];
+            let b1 = *chunk.get(1).unwrap_or(&0);
+            let b2 = *chunk.get(2).unwrap_or(&0);
+            let n = (b0 as u32) << 16 | (b1 as u32) << 8 | b2 as u32;
+            out.push(ALPHABET[(n >> 18 & 0x3F) as usize] as char);
+            out.push(ALPHABET[(n >> 12 & 0x3F) as usize] as char);
+            out.push(if chunk.len() > 1 {
+                ALPHABET[(n >> 6 & 0x3F) as usize] as char
+            } else {
+                '='
+            });
+            out.push(if chunk.len() > 2 {
+                ALPHABET[(n & 0x3F) as usize] as char
+            } else {
+                '='
+            });
+        }
+        out
+    }
+
+    #[test]
+    fn attachment_lf_line_endings_are_preserved() {
+        // The attachment uses bare LF; a naive quoted-printable encoder never
+        // touched them, so the wire bytes still contain LF, not CRLF.
+        let body: &[u8] = b"name,city\nHans,Wien\n";
+        let eml = build_eml("text/csv", "quoted-printable", body);
+
+        let got = first_attachment_bytes(&eml);
+        assert_eq!(got, body.to_vec(), "LF line endings must not become CRLF");
+    }
+
+    #[test]
+    fn attachment_latin1_bytes_without_charset_are_preserved() {
+        // No `charset` parameter is declared; the body is raw Latin-1
+        // ("Fernwärme", 0xE4 = 'ä'), sent as 8bit so no transfer decoding applies.
+        let body: &[u8] = b"Fernw\xe4rme\n";
+        let eml = build_eml("text/csv", "8bit", body);
+
+        let got = first_attachment_bytes(&eml);
+        assert_eq!(got, body.to_vec(), "non-UTF-8 bytes must not become U+FFFD");
+    }
+
+    #[test]
+    fn attachment_utf16le_bom_is_preserved() {
+        // Real UTF-16LE bytes including the BOM.
+        let body = utf16le_with_bom("Fernwärme");
+        let eml = build_eml("text/csv; charset=utf-16le", "8bit", &body);
+
+        let got = first_attachment_bytes(&eml);
+        assert_eq!(got, body, "UTF-16LE bytes and BOM must survive untouched");
+    }
+
+    #[test]
+    fn attachment_binary_8bit_passthrough_is_unaffected() {
+        // Non-text Content-Type => PartType::Binary, not PartType::Text. Bytes
+        // include NUL, 0xFF, and both bare LF and CRLF, none of which should be
+        // touched: this is a control-group test, not a bug repro.
+        let body: &[u8] = b"\x00\x01\xFEPDF\r\nsome\x00binary\nend\xFF";
+        let eml = build_eml("application/octet-stream", "8bit", body);
+
+        let got = first_attachment_bytes(&eml);
+        assert_eq!(got, body.to_vec(), "binary attachments must be untouched");
+    }
+
+    #[test]
+    fn attachment_binary_base64_roundtrips() {
+        let body: &[u8] = b"\x00\x01\xFEPDF\r\nsome\x00binary\nend\xFF";
+        let eml = build_eml(
+            "application/pdf",
+            "base64",
+            &base64_encode(body).into_bytes(),
+        );
+
+        let got = first_attachment_bytes(&eml);
+        assert_eq!(
+            got,
+            body.to_vec(),
+            "base64-transported binary must roundtrip"
+        );
+    }
+}
