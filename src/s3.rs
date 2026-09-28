@@ -37,17 +37,21 @@ pub async fn upload_message(
             let attachment_name = sanitize_filename(part.attachment_name().unwrap_or_default());
             let body = attachment::attachment_bytes(&message, part);
             let path = format!("{}attachments/{:02}-{}", base_path, ix, attachment_name);
+            let part_type = part
+                .content_type()
+                .and_then(|ct| Some(format!("{}/{}", ct.ctype(), ct.subtype()?).to_lowercase()));
+            let content_type = content_type(&path, part_type);
 
             let metadata = json!({
                 "index": ix,
                 "filename": attachment_name,
                 "rel_path": path,
-                "content_type": mime_guess::from_path(&path).first_raw(),
+                "content_type": content_type,
             });
 
             attachments_metadata.push(metadata);
 
-            Ok(upload_file(&s3_client, bucket, path, body))
+            Ok(upload_file(&s3_client, bucket, path, body, content_type))
         })
         .collect::<Result<Vec<_>>>()?;
 
@@ -55,7 +59,13 @@ pub async fn upload_message(
         message.headers_raw().map(|(k, v)| (k, v.trim())).collect();
     let headers_json = serde_json::to_vec_pretty(&headers_map)?;
     let headers_path = format!("{}headers.json", base_path);
-    uploads.push(upload_file(&s3_client, bucket, headers_path, headers_json));
+    uploads.push(upload_file(
+        &s3_client,
+        bucket,
+        headers_path,
+        headers_json,
+        None,
+    ));
 
     // this selects only the first part
     let body_text = message.text_bodies().next();
@@ -66,6 +76,7 @@ pub async fn upload_message(
             bucket,
             body_text_path,
             body_text.contents().to_vec(),
+            None,
         ));
     }
 
@@ -78,6 +89,7 @@ pub async fn upload_message(
             bucket,
             body_html_path,
             body_html.contents().to_vec(),
+            None,
         ));
     }
 
@@ -105,6 +117,15 @@ pub async fn upload_message(
     Ok(())
 }
 
+fn content_type_from_path(path: &str) -> Option<String> {
+    mime_guess::from_path(path).first_raw().map(str::to_string)
+}
+
+/// The extension-based guess wins; the part's own `Content-Type` is the fallback.
+fn content_type(path: &str, part_type: Option<String>) -> Option<String> {
+    content_type_from_path(path).or(part_type)
+}
+
 /// Makes an attachment name safe to embed in an S3 key: drops `/` and `\\`, collapses runs of
 /// dots and strips leading ones (so no `..` or hidden files), falls back to `attachment`.
 /// Single dots are kept, since the extension drives the guessed content type.
@@ -130,20 +151,21 @@ async fn upload_file(
     bucket: &str,
     path: String,
     body: Vec<u8>,
+    content_type: Option<String>,
 ) -> Result<()> {
-    let content_type = mime_guess::from_path(&path).first_raw();
+    let content_type = content_type.or_else(|| content_type_from_path(&path));
 
     debug!(
         "uploading file path={} content_type={}",
         path,
-        content_type.unwrap_or("")
+        content_type.as_deref().unwrap_or("")
     );
 
     let s3_req = s3_client
         .put_object()
         .bucket(bucket)
         .body(ByteStream::from(body))
-        .set_content_type(content_type.map(str::to_string))
+        .set_content_type(content_type)
         .key(path);
 
     s3_req.send().await.map_err(aws_sdk_s3::Error::from)?;
@@ -152,7 +174,21 @@ async fn upload_file(
 
 #[cfg(test)]
 mod tests {
-    use super::sanitize_filename;
+    use super::{content_type, sanitize_filename};
+
+    #[test]
+    fn content_type_prefers_extension_then_part_type() {
+        let part = Some("application/x-custom".to_string());
+        assert_eq!(
+            content_type("k/00-a.pdf", part.clone()).as_deref(),
+            Some("application/pdf")
+        );
+        assert_eq!(
+            content_type("k/00-attachment", part).as_deref(),
+            Some("application/x-custom")
+        );
+        assert_eq!(content_type("k/00-attachment", None), None);
+    }
 
     #[test]
     fn sanitizes_filenames() {

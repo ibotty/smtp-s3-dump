@@ -34,8 +34,8 @@ impl SmtpBackend {
         check_db: bool,
     ) -> Result<SmtpBackend> {
         let bucket = bucket.to_string();
-        let domain = Hostname::new(domain)
-            .map_err(|e| anyhow!("could not parse SMTP_DOMAIN: {}", e))?;
+        let domain =
+            Hostname::new(domain).map_err(|e| anyhow!("could not parse SMTP_DOMAIN: {}", e))?;
         let mut server_config = smtp_server::Config::new(domain.clone());
         server_config.max_message_size = MessageSize::new(100_000_000);
 

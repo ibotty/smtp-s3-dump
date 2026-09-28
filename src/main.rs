@@ -1,11 +1,13 @@
 use std::env;
-// use std::time::Duration;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use sqlx::postgres::PgPoolOptions;
 use tokio::net::TcpListener;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio_rustls::TlsAcceptor;
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 use tracing::instrument;
 use tracing::{info, warn};
 use tracing_subscriber::fmt::format::FmtSpan;
@@ -19,6 +21,8 @@ mod notify;
 mod s3;
 mod smtp;
 mod tls;
+
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
 
 #[tokio::main]
 #[instrument]
@@ -54,9 +58,6 @@ async fn main() -> Result<()> {
         .map(|s| s == "true")
         .unwrap_or(false);
 
-    // let shutdown = tokio_graceful::Shutdown::default();
-    // shutdown.spawn_task_fn(|guard| notify::watch_certs(resolver.clone(), guard));
-
     let resolver = tls::CertificateResolver::new(&cert_path, &key_path)?;
     // start certificate change watcher
     notify::watch_certs(resolver.clone()).await?;
@@ -91,9 +92,14 @@ async fn main() -> Result<()> {
         check_db,
     )?;
 
-    let server = start_smtp_server(smtp_bind_addr, backend);
-
-    let smtp_handler = tokio::spawn(server);
+    let tracker = TaskTracker::new();
+    let stop = CancellationToken::new();
+    let smtp_handler = tokio::spawn(start_smtp_server(
+        smtp_bind_addr,
+        backend,
+        tracker.clone(),
+        stop.clone(),
+    ));
 
     let ctrl_c = async {
         tokio::signal::ctrl_c()
@@ -115,20 +121,41 @@ async fn main() -> Result<()> {
     }
     tracing::info!("shutting down");
 
+    // stop accepting, then give in-flight sessions a chance to finish
+    stop.cancel();
+    tracker.close();
+    if tokio::time::timeout(SHUTDOWN_GRACE, tracker.wait())
+        .await
+        .is_err()
+    {
+        warn!(
+            "{} connection(s) still open after {:?}, aborting",
+            tracker.len(),
+            SHUTDOWN_GRACE
+        );
+    }
+
     Ok(())
 }
 
 #[instrument(skip_all)]
-async fn start_smtp_server(smtp_bind_addr: String, smtp_backend: SmtpBackend) -> Result<()> {
+async fn start_smtp_server(
+    smtp_bind_addr: String,
+    smtp_backend: SmtpBackend,
+    tracker: TaskTracker,
+    stop: CancellationToken,
+) -> Result<()> {
     info!("listening on {}", smtp_bind_addr);
     let listener = TcpListener::bind(smtp_bind_addr).await?;
 
-    while let Ok((socket, addr)) = listener.accept().await {
+    while let Some(Ok((socket, addr))) = stop.run_until_cancelled(listener.accept()).await {
         let mut session = smtp_backend.new_session()?;
         let server_config = smtp_backend.server_config.clone();
-        tokio::spawn(async move {
+        tracker.spawn(async move {
             let acceptor = TlsAcceptor::from(session.config.tls_config.clone());
-            if let Err(e) = smtp_server::serve(socket, &mut session, server_config, Some(acceptor)).await {
+            if let Err(e) =
+                smtp_server::serve(socket, &mut session, server_config, Some(acceptor)).await
+            {
                 warn!("could not handle connection from {}: {}", addr, e);
             }
         });
