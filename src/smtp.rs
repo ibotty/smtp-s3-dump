@@ -3,73 +3,18 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
 
-use anyhow::{anyhow, Result};
-use arc_swap::ArcSwap;
 use mail_parser::{Message, MessageParser};
-use smtp_server::{
-    Envelope, ForwardPath, Handler, Hostname, MessageSize, Recipient, Rejection, ReversePath,
-    Sender,
-};
+use smtp_server::{Envelope, ForwardPath, Handler, Recipient, Rejection, ReversePath, Sender};
 use sqlx::PgPool;
-use tokio_rustls::rustls::ServerConfig;
 use tracing::info;
 
 use crate::db;
 use crate::s3;
 
-pub struct SmtpBackend {
-    pub config: Arc<ArcSwap<Config>>,
-    pub server_config: Arc<smtp_server::Config>,
-}
-
-impl SmtpBackend {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        s3_config: aws_sdk_s3::Config,
-        pg_pool: PgPool,
-        tls_config: Arc<ServerConfig>,
-        domain: &str,
-        bucket: &str,
-        allowed_rcpts: Option<HashSet<String>>,
-        allowed_froms: Option<HashSet<String>>,
-        check_db: bool,
-    ) -> Result<SmtpBackend> {
-        let bucket = bucket.to_string();
-        let domain =
-            Hostname::new(domain).map_err(|e| anyhow!("could not parse SMTP_DOMAIN: {}", e))?;
-        let mut server_config = smtp_server::Config::new(domain.clone());
-        server_config.max_message_size = MessageSize::new(100_000_000);
-
-        let config = Arc::new(ArcSwap::from_pointee(Config {
-            s3_config,
-            pg_pool,
-            tls_config,
-            domain,
-            bucket,
-            allowed_rcpts,
-            allowed_froms,
-            check_db,
-        }));
-        Ok(SmtpBackend {
-            config,
-            server_config: Arc::new(server_config),
-        })
-    }
-
-    pub fn new_session(&self, peer: SocketAddr) -> Result<SmtpSession> {
-        Ok(SmtpSession {
-            config: self.config.load_full(),
-            peer,
-            event: None,
-        })
-    }
-}
-
 pub struct Config {
-    pub s3_config: aws_sdk_s3::Config,
+    pub s3: aws_sdk_s3::Client,
     pub pg_pool: PgPool,
-    pub tls_config: Arc<ServerConfig>,
-    pub domain: Hostname,
+    pub server: Arc<smtp_server::Config>,
     pub bucket: String,
     pub allowed_rcpts: Option<HashSet<String>>,
     /// Spam filter on the client-asserted `MAIL FROM`; there is no SMTP AUTH, SPF or DKIM, so
@@ -123,9 +68,19 @@ impl MailEvent {
 }
 
 pub struct SmtpSession {
-    pub config: Arc<Config>,
+    config: Arc<Config>,
     peer: SocketAddr,
     event: Option<MailEvent>,
+}
+
+impl SmtpSession {
+    pub fn new(config: Arc<Config>, peer: SocketAddr) -> Self {
+        SmtpSession {
+            config,
+            peer,
+            event: None,
+        }
+    }
 }
 
 impl Drop for SmtpSession {
@@ -161,10 +116,7 @@ impl Handler for SmtpSession {
     }
 
     async fn rcpt(&mut self, sender: &Sender, rcpt: &Recipient) -> Result<(), Rejection> {
-        let rcpt = match rcpt.path() {
-            ForwardPath::Postmaster => format!("postmaster@{}", self.config.domain),
-            ForwardPath::Mailbox(m) => m.to_string(),
-        };
+        let rcpt = self.rcpt_addr(rcpt.path());
         let result = self.check_rcpt(&sender.path().to_string(), &rcpt).await;
         if let Some(ev) = &mut self.event {
             match &result {
@@ -217,7 +169,18 @@ fn validate(message: &Message<'_>) -> Result<(), &'static str> {
     Ok(())
 }
 
+fn denied(list: &Option<HashSet<String>>, addr: &str) -> bool {
+    list.as_ref().is_some_and(|l| !l.contains(addr))
+}
+
 impl SmtpSession {
+    fn rcpt_addr(&self, path: &ForwardPath) -> String {
+        match path {
+            ForwardPath::Postmaster => format!("postmaster@{}", self.config.server.hostname),
+            ForwardPath::Mailbox(m) => m.to_string(),
+        }
+    }
+
     async fn check_rcpt(&self, from: &str, rcpt: &str) -> Result<(), (String, Rejection)> {
         let unavailable = |reason: &str| {
             (
@@ -226,21 +189,11 @@ impl SmtpSession {
             )
         };
 
-        if self
-            .config
-            .allowed_rcpts
-            .as_ref()
-            .is_some_and(|c| !c.contains(rcpt))
-        {
+        if denied(&self.config.allowed_rcpts, rcpt) {
             return Err(unavailable("rcpt_not_allowed"));
         }
 
-        if self
-            .config
-            .allowed_froms
-            .as_ref()
-            .is_some_and(|c| !c.contains(from))
-        {
+        if denied(&self.config.allowed_froms, from) {
             return Err(unavailable("from_not_allowed"));
         }
 
@@ -279,32 +232,19 @@ impl SmtpSession {
         validate(&parsed).map_err(invalid)?;
 
         for rcpt in env.rcpts().iter() {
-            let rcpt = match rcpt.path() {
-                ForwardPath::Postmaster => format!("postmaster@{}", self.config.domain),
-                ForwardPath::Mailbox(m) => m.to_string(),
-            };
-            self.store(&ev.from, &rcpt, &parsed).await.map_err(|e| {
-                (
-                    "failed",
-                    format!("{e:#}"),
-                    Rejection::transient("could not handle request"),
-                )
-            })?;
+            let rcpt = self.rcpt_addr(rcpt.path());
+            s3::upload_message(&self.config, &ev.from, &rcpt, &parsed)
+                .await
+                .map_err(|e| {
+                    (
+                        "failed",
+                        format!("{e:#}"),
+                        Rejection::transient("could not handle request"),
+                    )
+                })?;
             ev.stored += 1;
         }
         Ok(format!("Received {} bytes.", message.len()))
-    }
-
-    async fn store(&self, from: &str, rcpt: &str, message: &Message<'_>) -> Result<()> {
-        s3::upload_message(
-            &self.config.s3_config,
-            &self.config.pg_pool,
-            &self.config.bucket,
-            from,
-            rcpt,
-            message.clone(),
-        )
-        .await
     }
 }
 

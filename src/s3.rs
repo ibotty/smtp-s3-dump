@@ -3,10 +3,10 @@ use aws_sdk_s3::primitives::ByteStream;
 use futures::future::try_join_all;
 use mail_parser::{Message, MessagePart, MimeHeaders};
 use serde_json::{json, Map, Value};
-use sqlx::PgPool;
 
 use crate::attachment;
 use crate::db;
+use crate::smtp::Config;
 
 struct Upload {
     key: String,
@@ -14,13 +14,13 @@ struct Upload {
     content_type: Option<String>,
 }
 
-struct UploadPlan {
-    message_id: String,
+pub struct UploadPlan {
+    pub message_id: String,
     uploads: Vec<Upload>,
-    body_text: String,
-    body_html: String,
-    headers: Value,
-    attachments: Value,
+    pub body_text: String,
+    pub body_html: String,
+    pub headers: Value,
+    pub attachments: Value,
 }
 
 fn plan_uploads(rcpt: &str, from: &str, message: &Message<'_>) -> Result<UploadPlan> {
@@ -96,35 +96,22 @@ fn plan_uploads(rcpt: &str, from: &str, message: &Message<'_>) -> Result<UploadP
 }
 
 pub async fn upload_message(
-    s3_config: &aws_sdk_s3::Config,
-    pg_pool: &PgPool,
-    bucket: &str,
+    config: &Config,
     from: &str,
     rcpt: &str,
-    message: Message<'_>,
+    message: &Message<'_>,
 ) -> Result<()> {
-    let plan = plan_uploads(rcpt, from, &message)?;
-    let s3_client = aws_sdk_s3::Client::from_conf(s3_config.clone());
+    let mut plan = plan_uploads(rcpt, from, message)?;
+    let uploads = std::mem::take(&mut plan.uploads);
     try_join_all(
-        plan.uploads
+        uploads
             .into_iter()
-            .map(|u| upload_file(&s3_client, bucket, u.key, u.body, u.content_type)),
+            .map(|u| upload_file(&config.s3, &config.bucket, u)),
     )
     .await?;
 
     // afterwards, when complete, insert into DB
-    db::insert_mail(
-        pg_pool,
-        &plan.message_id,
-        rcpt,
-        from,
-        &plan.body_text,
-        &plan.body_html,
-        plan.headers,
-        plan.attachments,
-    )
-    .await?;
-    Ok(())
+    db::insert_mail(&config.pg_pool, rcpt, from, &plan).await
 }
 
 /// Headers as a JSON object of `name -> value`. A header that occurs once stays a plain string
@@ -198,25 +185,17 @@ fn sanitize_key_component(s: &str) -> String {
     }
 }
 
-async fn upload_file(
-    s3_client: &aws_sdk_s3::Client,
-    bucket: &str,
-    key: String,
-    body: Vec<u8>,
-    content_type: Option<String>,
-) -> Result<()> {
-    let s3_req = s3_client
+async fn upload_file(s3_client: &aws_sdk_s3::Client, bucket: &str, u: Upload) -> Result<()> {
+    s3_client
         .put_object()
         .bucket(bucket)
-        .body(ByteStream::from(body))
-        .set_content_type(content_type)
-        .key(&key);
-
-    s3_req
+        .body(ByteStream::from(u.body))
+        .set_content_type(u.content_type)
+        .key(&u.key)
         .send()
         .await
         .map_err(aws_sdk_s3::Error::from)
-        .with_context(|| format!("upload {key}"))?;
+        .with_context(|| format!("upload {}", u.key))?;
     Ok(())
 }
 

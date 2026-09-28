@@ -2,20 +2,21 @@ use anyhow::{Context, Result};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::{spawn, sync::mpsc::Receiver};
+use tokio::spawn;
 
-use notify_debouncer_mini::{
-    new_debouncer,
-    notify::{RecommendedWatcher, RecursiveMode},
-    DebounceEventResult, Debouncer,
-};
+use notify_debouncer_mini::{new_debouncer, notify::RecursiveMode, DebounceEventResult};
 use tracing::{error, info, instrument, trace};
 
 use crate::tls;
 
 #[instrument(skip_all)]
 pub async fn watch_certs(resolver: Arc<tls::CertificateResolver>) -> Result<()> {
-    let (mut debouncer, mut rx) = setup_watcher()?;
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    let mut debouncer = new_debouncer(Duration::from_secs(2), move |res: DebounceEventResult| {
+        if let Err(e) = tx.try_send(res) {
+            error!("could not send event {:?}", e);
+        }
+    })?;
 
     let binding = [&resolver.cert_path, &resolver.key_path];
     let mut dirs = binding
@@ -36,8 +37,8 @@ pub async fn watch_certs(resolver: Arc<tls::CertificateResolver>) -> Result<()> 
             match res {
                 Ok(event) => {
                     trace!("got inotify event {:?}", event);
-                    match resolver.refresh().await {
-                        Ok(s) => info!("refreshed certificates successfully. {:?}", s),
+                    match resolver.refresh() {
+                        Ok(()) => info!("refreshed certificates successfully"),
                         Err(e) => error!("could not refresh certificates: {:?}", e),
                     };
                 }
@@ -48,19 +49,6 @@ pub async fn watch_certs(resolver: Arc<tls::CertificateResolver>) -> Result<()> 
         }
     });
     Ok(())
-}
-
-#[instrument]
-pub fn setup_watcher() -> Result<(Debouncer<RecommendedWatcher>, Receiver<DebounceEventResult>)> {
-    let (tx, rx) = tokio::sync::mpsc::channel(1);
-
-    let debouncer = new_debouncer(Duration::from_secs(2), move |res: DebounceEventResult| {
-        if let Err(e) = tx.try_send(res) {
-            error!("could not send event {:?}", e);
-        }
-    })?;
-
-    Ok((debouncer, rx))
 }
 
 #[cfg(test)]

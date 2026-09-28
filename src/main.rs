@@ -1,20 +1,24 @@
+use std::collections::HashSet;
 use std::env;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
-use smtp_server::{reject_busy, shutdown_signal, SessionLimiter, Shutdown, TlsMode};
+use anyhow::{anyhow, Context, Result};
+use smtp_server::{
+    reject_busy, shutdown_signal, Hostname, MessageSize, SessionLimiter, Shutdown, TlsMode,
+};
 use sqlx::postgres::PgPoolOptions;
 use tokio::net::TcpListener;
 use tokio::signal::unix::{signal, Signal, SignalKind};
 use tokio::task::JoinSet;
+use tokio_rustls::rustls::ServerConfig;
 use tokio_rustls::TlsAcceptor;
 use tracing::instrument;
 use tracing::{error, info, warn};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
-use crate::smtp::SmtpBackend;
+use crate::smtp::{Config, SmtpSession};
 
 mod attachment;
 mod db;
@@ -41,9 +45,14 @@ fn parse_limit(name: &str, value: Option<String>, default: usize) -> Result<usiz
     }
 }
 
-/// True if nothing restricts who may submit mail.
-fn is_wide_open<T>(rcpts: &Option<T>, froms: &Option<T>, check_db: bool) -> bool {
-    rcpts.is_none() && froms.is_none() && !check_db
+fn required(name: &str) -> Result<String> {
+    env::var(name).with_context(|| format!("env variable {name} not provided"))
+}
+
+fn list(name: &str) -> Option<HashSet<String>> {
+    env::var(name)
+        .ok()
+        .map(|s| s.split(',').map(str::to_string).collect())
 }
 
 #[tokio::main]
@@ -72,27 +81,17 @@ async fn main() -> Result<()> {
             DEFAULT_MAX_SESSIONS_PER_IP,
         )?),
     );
-    let smtp_domain = env::var("SMTP_DOMAIN").context("env variable SMTP_DOMAIN not provided")?;
-    let bucket: String =
-        env::var("BUCKET_NAME").context("env variable BUCKET_NAME not provided")?;
-    let aws_endpoint_url: Option<String> = env::var("AWS_ENDPOINT_URL").ok();
-    let cert_path =
-        env::var("SMTP_CERT_FILE").context("env variable SMTP_CERT_FILE not provided")?;
-    let key_path = env::var("SMTP_KEY_FILE").context("env variable SMTP_KEY_FILE not provided")?;
-    let database_url =
-        env::var("DATABASE_URL").context("env variable DATABASE_URL not provided")?;
+    let smtp_domain = required("SMTP_DOMAIN")?;
+    let bucket = required("BUCKET_NAME")?;
+    let cert_path = required("SMTP_CERT_FILE")?;
+    let key_path = required("SMTP_KEY_FILE")?;
+    let database_url = required("DATABASE_URL")?;
 
-    let allowed_rcpts = env::var("ALLOWED_RCPTS")
-        .map(|s| s.split(',').map(str::to_string).collect())
-        .ok();
-    let allowed_froms = env::var("ALLOWED_FROMS")
-        .map(|s| s.split(',').map(str::to_string).collect())
-        .ok();
-    let check_db: bool = env::var("CHECK_ALLOWED_IN_DB")
-        .map(|s| s == "true")
-        .unwrap_or(false);
+    let allowed_rcpts = list("ALLOWED_RCPTS");
+    let allowed_froms = list("ALLOWED_FROMS");
+    let check_db = env::var("CHECK_ALLOWED_IN_DB").is_ok_and(|s| s == "true");
 
-    if is_wide_open(&allowed_rcpts, &allowed_froms, check_db) {
+    if allowed_rcpts.is_none() && allowed_froms.is_none() && !check_db {
         warn!(
             "ALLOWED_RCPTS, ALLOWED_FROMS and CHECK_ALLOWED_IN_DB are all unset: \
              anyone who can reach this port can store mail"
@@ -102,17 +101,13 @@ async fn main() -> Result<()> {
     let resolver = tls::CertificateResolver::new(&cert_path, &key_path)?;
     // start certificate change watcher
     notify::watch_certs(resolver.clone()).await?;
-    let tls_config = tls::safe_tls_config(resolver)?;
+    let acceptor = TlsAcceptor::from(Arc::new(
+        ServerConfig::builder()
+            .with_no_client_auth()
+            .with_cert_resolver(resolver),
+    ));
 
-    let aws_config = aws_config::from_env();
-    // remove once https://github.com/awslabs/smithy-rs/issues/2863 lands
-    let aws_config = if let Some(endpoint) = aws_endpoint_url {
-        aws_config.endpoint_url(endpoint)
-    } else {
-        aws_config
-    };
-    let aws_config = aws_config.load().await;
-
+    let aws_config = aws_config::load_from_env().await;
     let s3_config = aws_sdk_s3::config::Builder::from(&aws_config)
         .force_path_style(true)
         .build();
@@ -122,23 +117,32 @@ async fn main() -> Result<()> {
         .connect(&database_url)
         .await?;
 
-    let backend = SmtpBackend::new(
-        s3_config,
+    let domain =
+        Hostname::new(&smtp_domain).map_err(|e| anyhow!("could not parse SMTP_DOMAIN: {}", e))?;
+    let mut server = smtp_server::Config::new(domain);
+    server.max_message_size = MessageSize::new(100_000_000);
+    let config = Arc::new(Config {
+        s3: aws_sdk_s3::Client::from_conf(s3_config),
         pg_pool,
-        tls_config,
-        &smtp_domain,
-        &bucket,
+        server: Arc::new(server),
+        bucket,
         allowed_rcpts,
         allowed_froms,
         check_db,
-    )?;
+    });
 
     let mut sigint = signal(SignalKind::interrupt()).context("failed to install SIGINT handler")?;
     let mut sigterm =
         signal(SignalKind::terminate()).context("failed to install SIGTERM handler")?;
 
     let (trigger, stop_rx) = shutdown_signal();
-    let mut server = tokio::spawn(start_smtp_server(smtp_bind_addr, backend, limiter, stop_rx));
+    let mut server = tokio::spawn(start_smtp_server(
+        smtp_bind_addr,
+        config,
+        acceptor,
+        limiter,
+        stop_rx,
+    ));
 
     tokio::select! {
         _ = next_signal(&mut sigint, &mut sigterm) => {},
@@ -172,7 +176,8 @@ async fn next_signal(sigint: &mut Signal, sigterm: &mut Signal) {
 #[instrument(skip_all)]
 async fn start_smtp_server(
     smtp_bind_addr: String,
-    smtp_backend: SmtpBackend,
+    config: Arc<Config>,
+    acceptor: TlsAcceptor,
     limiter: Arc<SessionLimiter<IpAddr>>,
     stop: Shutdown,
 ) -> Result<()> {
@@ -203,12 +208,12 @@ async fn start_smtp_server(
                         });
                         continue;
                     };
-                    let mut session = smtp_backend.new_session(addr)?;
-                    let server_config = smtp_backend.server_config.clone();
+                    let mut session = SmtpSession::new(config.clone(), addr);
+                    let server_config = config.server.clone();
+                    let acceptor = acceptor.clone();
                     let stop = stop.clone();
                     sessions.spawn(async move {
                         let _guard = guard;
-                        let acceptor = TlsAcceptor::from(session.config.tls_config.clone());
                         if let Err(e) = smtp_server::serve(
                             socket,
                             &mut session,
@@ -247,15 +252,5 @@ mod tests {
         assert_eq!(parse_limit("X", Some("7".into()), 5).unwrap(), 7);
         assert!(parse_limit("X", Some("0".into()), 5).is_err());
         assert!(parse_limit("X", Some("abc".into()), 5).is_err());
-    }
-
-    #[test]
-    fn wide_open_detection() {
-        let some = Some(["a@b".to_string()]);
-        let none: Option<[String; 1]> = None;
-        assert!(is_wide_open(&none, &none, false));
-        assert!(!is_wide_open(&some, &none, false));
-        assert!(!is_wide_open(&none, &some, false));
-        assert!(!is_wide_open(&none, &none, true));
     }
 }

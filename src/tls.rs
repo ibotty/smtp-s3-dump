@@ -2,29 +2,18 @@ use std::{fs::File, io::BufReader, sync::Arc};
 
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
-// use tokio::{fs::File, io::AsyncReadExt, try_join};
 use tokio_rustls::rustls::{
     crypto::CryptoProvider,
     server::{ClientHello, ResolvesServerCert},
     sign::CertifiedKey,
-    ServerConfig,
 };
 use tracing::{instrument, trace};
-
-#[instrument(skip_all)]
-pub fn safe_tls_config(resolver: Arc<CertificateResolver>) -> Result<Arc<ServerConfig>> {
-    Ok(Arc::new(
-        ServerConfig::builder()
-            .with_no_client_auth()
-            .with_cert_resolver(resolver),
-    ))
-}
 
 #[derive(Debug)]
 pub struct CertificateResolver {
     pub cert_path: String,
     pub key_path: String,
-    pub certified_key: Arc<ArcSwap<CertifiedKey>>,
+    pub certified_key: ArcSwap<CertifiedKey>,
 }
 
 impl CertificateResolver {
@@ -51,9 +40,7 @@ impl CertificateResolver {
 
     #[instrument]
     pub fn new(cert_path: &str, key_path: &str) -> Result<Arc<Self>> {
-        let certified_key = Arc::new(ArcSwap::from_pointee(Self::load_certs_and_key(
-            cert_path, key_path,
-        )?));
+        let certified_key = ArcSwap::from_pointee(Self::load_certs_and_key(cert_path, key_path)?);
 
         let cert_path = cert_path.to_string();
         let key_path = key_path.to_string();
@@ -65,7 +52,7 @@ impl CertificateResolver {
     }
 
     #[instrument(skip_all)]
-    pub async fn refresh(&self) -> Result<()> {
+    pub fn refresh(&self) -> Result<()> {
         trace!("refreshing certificates");
         let certified_key = Self::load_certs_and_key(&self.cert_path, &self.key_path)?;
 
