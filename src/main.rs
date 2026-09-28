@@ -1,8 +1,10 @@
 use std::env;
+use std::net::IpAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use smtp_server::{shutdown_signal, Shutdown, TlsMode};
+use smtp_server::{reject_busy, shutdown_signal, SessionLimiter, Shutdown, TlsMode};
 use sqlx::postgres::PgPoolOptions;
 use tokio::net::TcpListener;
 use tokio::signal::unix::{signal, Signal, SignalKind};
@@ -26,6 +28,25 @@ mod tls;
 /// kill timeout (Kubernetes `terminationGracePeriodSeconds` defaults to 30s).
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(25);
 
+const DEFAULT_MAX_SESSIONS: usize = 100;
+const DEFAULT_MAX_SESSIONS_PER_IP: usize = 10;
+
+/// Parse a positive integer limit; unset falls back to `default`, invalid/zero is an error.
+fn parse_limit(name: &str, value: Option<String>, default: usize) -> Result<usize> {
+    match value {
+        None => Ok(default),
+        Some(v) => match v.trim().parse::<usize>() {
+            Ok(n) if n > 0 => Ok(n),
+            _ => anyhow::bail!("env variable {name} must be a positive integer, got {v:?}"),
+        },
+    }
+}
+
+/// True if nothing restricts who may submit mail.
+fn is_wide_open<T>(rcpts: &Option<T>, froms: &Option<T>, check_db: bool) -> bool {
+    rcpts.is_none() && froms.is_none() && !check_db
+}
+
 #[tokio::main]
 #[instrument]
 async fn main() -> Result<()> {
@@ -39,7 +60,19 @@ async fn main() -> Result<()> {
         .install_default()
         .expect("failed to install default rustls crypto provider");
 
-    let smtp_bind_addr = env::var("STMP_BIND_ADDR").unwrap_or("0.0.0.0:2525".to_string());
+    let smtp_bind_addr = env::var("SMTP_BIND_ADDR").unwrap_or("0.0.0.0:2525".to_string());
+    let limiter = SessionLimiter::new(
+        parse_limit(
+            "MAX_SESSIONS",
+            env::var("MAX_SESSIONS").ok(),
+            DEFAULT_MAX_SESSIONS,
+        )?,
+        Some(parse_limit(
+            "MAX_SESSIONS_PER_IP",
+            env::var("MAX_SESSIONS_PER_IP").ok(),
+            DEFAULT_MAX_SESSIONS_PER_IP,
+        )?),
+    );
     let smtp_domain = env::var("SMTP_DOMAIN").context("env variable SMTP_DOMAIN not provided")?;
     let bucket: String =
         env::var("BUCKET_NAME").context("env variable BUCKET_NAME not provided")?;
@@ -59,6 +92,13 @@ async fn main() -> Result<()> {
     let check_db: bool = env::var("CHECK_ALLOWED_IN_DB")
         .map(|s| s == "true")
         .unwrap_or(false);
+
+    if is_wide_open(&allowed_rcpts, &allowed_froms, check_db) {
+        warn!(
+            "ALLOWED_RCPTS, ALLOWED_FROMS and CHECK_ALLOWED_IN_DB are all unset: \
+             anyone who can reach this port can store mail"
+        );
+    }
 
     let resolver = tls::CertificateResolver::new(&cert_path, &key_path)?;
     // start certificate change watcher
@@ -99,7 +139,7 @@ async fn main() -> Result<()> {
         signal(SignalKind::terminate()).context("failed to install SIGTERM handler")?;
 
     let (trigger, stop_rx) = shutdown_signal();
-    let mut server = tokio::spawn(start_smtp_server(smtp_bind_addr, backend, stop_rx));
+    let mut server = tokio::spawn(start_smtp_server(smtp_bind_addr, backend, limiter, stop_rx));
 
     tokio::select! {
         _ = next_signal(&mut sigint, &mut sigterm) => {},
@@ -134,6 +174,7 @@ async fn next_signal(sigint: &mut Signal, sigterm: &mut Signal) {
 async fn start_smtp_server(
     smtp_bind_addr: String,
     smtp_backend: SmtpBackend,
+    limiter: Arc<SessionLimiter<IpAddr>>,
     stop: Shutdown,
 ) -> Result<()> {
     info!("listening on {}", smtp_bind_addr);
@@ -154,10 +195,20 @@ async fn start_smtp_server(
             }
             accepted = listener.accept() => match accepted {
                 Ok((socket, addr)) => {
+                    let Some(guard) = limiter.try_acquire(addr.ip()) else {
+                        warn!("session limit reached, refusing connection from {}", addr);
+                        sessions.spawn(async move {
+                            if let Err(e) = reject_busy(socket).await {
+                                warn!("could not send busy reply to {}: {}", addr, e);
+                            }
+                        });
+                        continue;
+                    };
                     let mut session = smtp_backend.new_session()?;
                     let server_config = smtp_backend.server_config.clone();
                     let stop = stop.clone();
                     sessions.spawn(async move {
+                        let _guard = guard;
                         let acceptor = TlsAcceptor::from(session.config.tls_config.clone());
                         if let Err(e) = smtp_server::serve(
                             socket,
@@ -165,7 +216,6 @@ async fn start_smtp_server(
                             server_config,
                             TlsMode::StartTls(acceptor),
                             Some(stop),
-
                         )
                         .await
                         {
@@ -186,4 +236,27 @@ async fn start_smtp_server(
     info!("waiting for {} open session(s)", sessions.len());
     while sessions.join_next().await.is_some() {}
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_limit_cases() {
+        assert_eq!(parse_limit("X", None, 5).unwrap(), 5);
+        assert_eq!(parse_limit("X", Some("7".into()), 5).unwrap(), 7);
+        assert!(parse_limit("X", Some("0".into()), 5).is_err());
+        assert!(parse_limit("X", Some("abc".into()), 5).is_err());
+    }
+
+    #[test]
+    fn wide_open_detection() {
+        let some = Some(["a@b".to_string()]);
+        let none: Option<[String; 1]> = None;
+        assert!(is_wide_open(&none, &none, false));
+        assert!(!is_wide_open(&some, &none, false));
+        assert!(!is_wide_open(&none, &some, false));
+        assert!(!is_wide_open(&none, &none, true));
+    }
 }
