@@ -14,7 +14,7 @@ license = "GPL-3.0-or-later"
 anyhow = "1"
 arc-swap = "1.6.0"
 aws-config = { version = "1", features = ["behavior-version-latest"] }
-aws-sdk-s3 = "1"
+aws-sdk-s3 = { version = "1", default-features = false, features = ["default-https-client", "http-1x", "rt-tokio", "sigv4a"] }
 futures = "0.3.28"
 mail-parser = "0.11"
 mime_guess = "2"
