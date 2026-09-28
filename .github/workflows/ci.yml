@@ -1,0 +1,57 @@
+---
+name: CI
+on:
+  workflow_call:
+  schedule:
+  - cron: '0 0 * * *'
+  push:
+    branches:
+    - main
+    paths: &paths
+    - 'src/**'
+    - 'crates/**'
+    - 'tests/**'
+    - 'Cargo.toml'
+    - 'Cargo.lock'
+    - '.sqlx/**'
+    - '.github/workflows/ci.yml'
+  pull_request:
+    paths: *paths
+
+permissions:
+  contents: read
+
+jobs:
+
+  test:
+    name: Check and test
+    if: ${{ github.event_name != 'schedule' }}
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+    - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      with:
+        components: rustfmt, clippy
+    - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+    - run: sudo apt-get install -y swaks
+
+    - name: Format
+      run: cargo fmt --all --check
+
+    - name: Clippy
+      run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+    - name: Test
+      run: cargo test --workspace --all-features
+
+  audit:
+    name: Cargo audit
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+    - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
