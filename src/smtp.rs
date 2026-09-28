@@ -126,7 +126,7 @@ impl SmtpSession {
             return map.contains(addr);
         }
 
-        true;
+        true
     }
 }
 
