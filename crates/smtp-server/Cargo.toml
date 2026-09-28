@@ -1,0 +1,23 @@
+[package]
+name = "smtp-server"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+smtp-proto = "0.2"
+tokio = { version = "1", features = ["io-util", "net", "sync", "time"], optional = true }
+tokio-rustls = { version = "0.26", optional = true }
+futures-util = { version = "0.3", default-features = false, features = ["std"], optional = true }
+tracing = { version = "0.1", optional = true }
+
+[dev-dependencies]
+mail-parser = "0.11"
+proptest = "1.11.0"
+rustls-pemfile = "2.2.0"
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "fs", "sync", "io-util"] }
+
+[features]
+default = ["tokio", "tracing"]
+tokio = ["dep:tokio", "dep:tokio-rustls", "dep:futures-util"]
+tracing = ["dep:tracing"]
