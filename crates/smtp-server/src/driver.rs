@@ -23,6 +23,11 @@ use crate::{
 /// (`tracing::error!` is logged if the `tracing` feature is enabled) instead of taking the
 /// whole process down. Don't reuse `&mut Self` after [`serve`] returned due to a panic.
 pub trait Handler: Send {
+    /// Text that follows `220 <hostname> ` in the greeting (default `ESMTP`). Control
+    /// characters are replaced by spaces.
+    fn greeting(&mut self) -> impl Future<Output = String> + Send {
+        async { "ESMTP".to_owned() }
+    }
     /// React to `EHLO`.
     fn ehlo(
         &mut self,
@@ -83,17 +88,36 @@ pub trait Handler: Send {
     }
 }
 
-async fn catch<F: Future<Output = Result<R, Rejection>>, R>(fut: F) -> Result<R, Rejection> {
+async fn catch_panic<F: Future>(fut: F) -> Result<F::Output, Rejection> {
     AssertUnwindSafe(fut)
         .catch_unwind()
         .await
-        .unwrap_or_else(|payload| {
+        .map_err(|payload| {
             #[cfg(feature = "tracing")]
             tracing::error!(?payload, "SMTP handler panicked");
             #[cfg(not(feature = "tracing"))]
             let _ = payload;
-            Err(Rejection::closing("internal error"))
+            Rejection::closing("internal error")
         })
+}
+
+async fn catch<F: Future<Output = Result<R, Rejection>>, R>(fut: F) -> Result<R, Rejection> {
+    catch_panic(fut).await?
+}
+
+async fn greet<T: Transport, H: Handler>(
+    cfg: &Arc<Config>,
+    h: &mut H,
+) -> Result<Session<T>, Rejection> {
+    let text = catch_panic(h.greeting()).await?;
+    Ok(Session::with_greeting(cfg.clone(), &text))
+}
+
+async fn refuse<S: AsyncWrite + Unpin>(stream: &mut S, r: Rejection) -> io::Result<()> {
+    let mut reply = Vec::new();
+    r.write(&mut reply);
+    stream.write_all(&reply).await?;
+    stream.shutdown().await
 }
 
 /// How a connection is (or is not) encrypted.
@@ -129,12 +153,18 @@ where
 {
     match tls {
         TlsMode::None => {
-            let session = Session::<Cleartext>::new(cfg.clone());
+            let session = match greet::<Cleartext, _>(&cfg, handler).await {
+                Ok(s) => s,
+                Err(r) => return refuse(&mut stream, r).await,
+            };
             run(&mut stream, session, handler, &cfg, &mut shutdown).await?;
             Ok(())
         }
         TlsMode::StartTls(acceptor) => {
-            let session = Session::<Plain>::new(cfg.clone());
+            let session = match greet::<Plain, _>(&cfg, handler).await {
+                Ok(s) => s,
+                Err(r) => return refuse(&mut stream, r).await,
+            };
             let Some(mut start_tls) =
                 run(&mut stream, session, handler, &cfg, &mut shutdown).await?
             else {
@@ -155,7 +185,10 @@ where
         }
         TlsMode::Implicit(acceptor) => {
             let mut stream = acceptor.accept(stream).await?;
-            let session = Session::<Tls>::new(cfg.clone());
+            let session = match greet::<Tls, _>(&cfg, handler).await {
+                Ok(s) => s,
+                Err(r) => return refuse(&mut stream, r).await,
+            };
             run(&mut stream, session, handler, &cfg, &mut shutdown).await?;
             stream.shutdown().await
         }

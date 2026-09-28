@@ -207,11 +207,23 @@ fn push_ok(out: &mut Vec<u8>, code: u16, esc: (u8, u8, u8), text: &str) {
 }
 
 impl<T: Transport> Session<T> {
-    /// Starts a new session; the greeting is queued immediately (take it via [`Session::take_output`]).
+    /// Starts a new session; the greeting (`220 <hostname> ESMTP`) is queued immediately
+    /// (take it via [`Session::take_output`]).
     pub fn new(cfg: Arc<Config>) -> Self {
+        Self::with_greeting(cfg, "ESMTP")
+    }
+
+    /// Like [`Session::new`], with `text` following `220 <hostname> ` in the greeting.
+    /// Control characters in `text` (notably CR/LF) are replaced by spaces.
+    pub fn with_greeting(cfg: Arc<Config>, text: &str) -> Self {
         let mut output = Vec::new();
         use std::io::Write;
-        let _ = write!(output, "220 {} ESMTP\r\n", cfg.hostname);
+        let _ = write!(
+            output,
+            "220 {} {}\r\n",
+            cfg.hostname,
+            crate::reply::sanitize_text(text)
+        );
         Self {
             cfg,
             phase: Phase::Fresh,
@@ -1048,6 +1060,18 @@ mod tests {
             }
             _ => panic!("unexpected poll result for {line:?}"),
         }
+    }
+
+    #[test]
+    fn custom_greeting_text_is_sanitised() {
+        let mut s = Session::<Cleartext>::with_greeting(cfg(), "hello there");
+        assert_eq!(s.take_output(), b"220 mx.example.org hello there\r\n");
+
+        let mut s = Session::<Cleartext>::with_greeting(cfg(), "hi\r\n250 injected");
+        assert_eq!(s.take_output(), b"220 mx.example.org hi  250 injected\r\n");
+
+        let mut s = Session::<Cleartext>::new(cfg());
+        assert_eq!(s.take_output(), b"220 mx.example.org ESMTP\r\n");
     }
 
     #[test]

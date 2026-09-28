@@ -316,3 +316,66 @@ async fn data_deadline_applies_while_discarding_oversize_message() {
     assert!(all.windows(3).any(|w| w == b"421"), "{all:?}");
     task.await.expect("task panicked").expect("serve failed");
 }
+
+struct Greeter(&'static str);
+
+impl Handler for Greeter {
+    async fn data_end(&mut self, _env: &Envelope, _msg: Vec<u8>) -> Result<String, Rejection> {
+        Ok(String::new())
+    }
+    async fn greeting(&mut self) -> String {
+        self.0.to_owned()
+    }
+}
+
+async fn greeting_of(mut handler: impl Handler + 'static) -> Vec<u8> {
+    let (mut client, server) = tokio::io::duplex(4096);
+    let task = tokio::spawn(async move {
+        smtp_server::serve(server, &mut handler, cfg(), TlsMode::None, None).await
+    });
+    let mut buf = vec![0u8; 4096];
+    let n = read(&mut client, &mut buf).await;
+    let greeting = buf[..n].to_vec();
+    client.write_all(b"QUIT\r\n").await.unwrap();
+    while read(&mut client, &mut buf).await != 0 {}
+    task.await.expect("task panicked").expect("serve failed");
+    greeting
+}
+
+#[tokio::test]
+async fn handler_supplies_greeting_text() {
+    assert_eq!(
+        greeting_of(Greeter("welcome")).await,
+        b"220 mx.example.org welcome\r\n"
+    );
+    assert_eq!(
+        greeting_of(Greeter("hi\r\n250 injected")).await,
+        b"220 mx.example.org hi  250 injected\r\n"
+    );
+    assert_eq!(greeting_of(Echo).await, b"220 mx.example.org ESMTP\r\n");
+}
+
+#[tokio::test]
+async fn panicking_greeting_closes_with_421() {
+    struct Boom;
+    impl Handler for Boom {
+        async fn data_end(&mut self, _: &Envelope, _: Vec<u8>) -> Result<String, Rejection> {
+            Ok(String::new())
+        }
+        async fn greeting(&mut self) -> String {
+            panic!("boom")
+        }
+    }
+    let (mut client, server) = tokio::io::duplex(4096);
+    let task = tokio::spawn(async move {
+        smtp_server::serve(server, &mut Boom, cfg(), TlsMode::None, None).await
+    });
+    let mut out = Vec::new();
+    client.read_to_end(&mut out).await.unwrap();
+    assert!(
+        out.starts_with(b"421 "),
+        "{}",
+        String::from_utf8_lossy(&out)
+    );
+    task.await.expect("task panicked").expect("serve failed");
+}
