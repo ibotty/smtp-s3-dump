@@ -4,8 +4,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use smtp_server::{Config, Envelope, Handler, Hostname, Recipient, Rejection, Sender, TlsMode};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use smtp_server::{
+    Config, Envelope, Handler, Hostname, Recipient, Rejection, Sender, Shutdown, TlsMode,
+};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 
 struct Echo;
 
@@ -15,118 +17,110 @@ impl Handler for Echo {
     }
 }
 
-fn cfg() -> Arc<Config> {
+type Serve = tokio::task::JoinHandle<std::io::Result<()>>;
+
+fn cfg_with(f: impl FnOnce(&mut Config)) -> Arc<Config> {
     let mut c = Config::new(Hostname::new("mx.example.org").unwrap());
-    c.command_timeout = Duration::from_secs(5);
-    c.data_timeout = Duration::from_secs(5);
-    c.data_deadline = Duration::from_secs(5);
+    f(&mut c);
     Arc::new(c)
 }
 
-async fn read(client: &mut tokio::io::DuplexStream, buf: &mut [u8]) -> usize {
+fn cfg() -> Arc<Config> {
+    cfg_with(|c| {
+        c.command_timeout = Duration::from_secs(5);
+        c.data_timeout = Duration::from_secs(5);
+        c.data_deadline = Duration::from_secs(5);
+    })
+}
+
+fn spawn(
+    mut handler: impl Handler + 'static,
+    config: Arc<Config>,
+    shutdown: Option<Shutdown>,
+) -> (DuplexStream, Serve) {
+    let (client, server) = tokio::io::duplex(4096);
+    let task = tokio::spawn(async move {
+        smtp_server::serve(server, &mut handler, config, TlsMode::None, shutdown).await
+    });
+    (client, task)
+}
+
+async fn join(task: Serve) {
+    task.await.expect("task panicked").expect("serve failed");
+}
+
+async fn read(client: &mut DuplexStream, buf: &mut [u8]) -> usize {
     client.read(buf).await.expect("read")
+}
+
+async fn expect(client: &mut DuplexStream, prefix: &[u8]) {
+    let mut buf = vec![0u8; 4096];
+    let n = read(client, &mut buf).await;
+    assert!(
+        buf[..n].starts_with(prefix),
+        "expected {prefix:?}, got {:?}",
+        String::from_utf8_lossy(&buf[..n])
+    );
+}
+
+async fn rest(client: &mut DuplexStream) -> String {
+    let mut out = Vec::new();
+    client.read_to_end(&mut out).await.expect("read to EOF");
+    String::from_utf8(out).unwrap()
+}
+
+async fn send(client: &mut DuplexStream, cmd: &[u8], reply: &[u8]) {
+    client.write_all(cmd).await.unwrap();
+    expect(client, reply).await;
+}
+
+/// Greeting, EHLO, MAIL FROM and RCPT TO, each expected to succeed.
+async fn envelope(client: &mut DuplexStream) {
+    expect(client, b"220").await;
+    for cmd in [
+        &b"EHLO client\r\n"[..],
+        b"MAIL FROM:<a@b>\r\n",
+        b"RCPT TO:<c@d>\r\n",
+    ] {
+        send(client, cmd, b"250").await;
+    }
 }
 
 #[tokio::test]
 async fn buffered_transaction_with_two_recipients() {
-    let (mut client, server) = tokio::io::duplex(4096);
-    let cfg = cfg();
-    let mut handler = Echo;
-    let task = tokio::spawn(async move {
-        smtp_server::serve(server, &mut handler, cfg, TlsMode::None, None).await
-    });
-
-    let mut buf = vec![0u8; 4096];
-    let n = read(&mut client, &mut buf).await;
-    assert!(buf[..n].starts_with(b"220"));
-
-    client.write_all(b"EHLO client\r\n").await.unwrap();
-    let n = read(&mut client, &mut buf).await;
-    assert!(buf[..n].starts_with(b"250"));
-
-    client.write_all(b"MAIL FROM:<a@b>\r\n").await.unwrap();
-    let n = read(&mut client, &mut buf).await;
-    assert!(buf[..n].starts_with(b"250"));
-
-    client.write_all(b"RCPT TO:<c@d>\r\n").await.unwrap();
-    let n = read(&mut client, &mut buf).await;
-    assert!(buf[..n].starts_with(b"250"));
-
-    client.write_all(b"RCPT TO:<e@f>\r\n").await.unwrap();
-    let n = read(&mut client, &mut buf).await;
-    assert!(buf[..n].starts_with(b"250"));
-
-    client.write_all(b"DATA\r\n").await.unwrap();
-    let n = read(&mut client, &mut buf).await;
-    assert!(buf[..n].starts_with(b"354"));
-
+    let (mut client, task) = spawn(Echo, cfg(), None);
+    expect(&mut client, b"220").await;
+    send(&mut client, b"EHLO client\r\n", b"250").await;
+    send(&mut client, b"MAIL FROM:<a@b>\r\n", b"250").await;
+    send(&mut client, b"RCPT TO:<c@d>\r\n", b"250").await;
+    send(&mut client, b"RCPT TO:<e@f>\r\n", b"250").await;
+    send(&mut client, b"DATA\r\n", b"354").await;
     client.write_all(b"hello world\r\n.\r\n").await.unwrap();
+    let mut buf = vec![0u8; 4096];
     let n = read(&mut client, &mut buf).await;
     assert!(buf[..n].starts_with(b"250"));
     assert!(buf[..n].windows(7).any(|w| w == b"13 byte"));
-
-    client.write_all(b"QUIT\r\n").await.unwrap();
-    let n = read(&mut client, &mut buf).await;
-    assert!(buf[..n].starts_with(b"221"));
-
-    task.await.expect("task panicked").expect("serve failed");
+    send(&mut client, b"QUIT\r\n", b"221").await;
+    join(task).await;
 }
 
 #[tokio::test]
 async fn command_timeout_closes_with_421() {
-    let (mut client, server) = tokio::io::duplex(4096);
-    let mut c = Config::new(Hostname::new("mx.example.org").unwrap());
-    c.command_timeout = Duration::from_millis(100);
-    let mut handler = Echo;
-    let task = tokio::spawn(async move {
-        smtp_server::serve(server, &mut handler, Arc::new(c), TlsMode::None, None).await
-    });
-
-    let mut buf = vec![0u8; 4096];
-    read(&mut client, &mut buf).await; // greeting
-    let n = read(&mut client, &mut buf).await;
-    assert!(buf[..n].starts_with(b"421"));
-    assert_eq!(
-        read(&mut client, &mut buf).await,
-        0,
-        "connection must close"
-    );
-
-    task.await.expect("task panicked").expect("serve failed");
+    let config = cfg_with(|c| c.command_timeout = Duration::from_millis(100));
+    let (mut client, task) = spawn(Echo, config, None);
+    expect(&mut client, b"220").await;
+    assert!(rest(&mut client).await.starts_with("421"));
+    join(task).await;
 }
 
 #[tokio::test]
 async fn data_deadline_closes_with_421() {
-    let (mut client, server) = tokio::io::duplex(4096);
-    let mut c = Config::new(Hostname::new("mx.example.org").unwrap());
-    c.data_deadline = Duration::from_millis(100);
-    let mut handler = Echo;
-    let task = tokio::spawn(async move {
-        smtp_server::serve(server, &mut handler, Arc::new(c), TlsMode::None, None).await
-    });
-
-    let mut buf = vec![0u8; 4096];
-    read(&mut client, &mut buf).await; // greeting
-    client
-        .write_all(b"EHLO client\r\nMAIL FROM:<a@b>\r\nRCPT TO:<c@d>\r\nDATA\r\n")
-        .await
-        .unwrap();
-    // Drain replies until the "354" that starts the DATA phase (the deadline clock starts then).
-    let mut got = Vec::new();
-    while !got.windows(3).any(|w| w == b"354") {
-        let n = read(&mut client, &mut buf).await;
-        got.extend_from_slice(&buf[..n]);
-    }
-
-    let n = read(&mut client, &mut buf).await;
-    assert!(buf[..n].starts_with(b"421"));
-    assert_eq!(
-        read(&mut client, &mut buf).await,
-        0,
-        "connection must close"
-    );
-
-    task.await.expect("task panicked").expect("serve failed");
+    let config = cfg_with(|c| c.data_deadline = Duration::from_millis(100));
+    let (mut client, task) = spawn(Echo, config, None);
+    envelope(&mut client).await;
+    send(&mut client, b"DATA\r\n", b"354").await;
+    assert!(rest(&mut client).await.starts_with("421"));
+    join(task).await;
 }
 
 struct Panicky;
@@ -143,87 +137,31 @@ impl Handler for Panicky {
 
 #[tokio::test]
 async fn panicking_handler_closes_with_421() {
-    let (mut client, server) = tokio::io::duplex(4096);
-    let cfg = cfg();
-    let mut handler = Panicky;
-    let task = tokio::spawn(async move {
-        smtp_server::serve(server, &mut handler, cfg, TlsMode::None, None).await
-    });
-
-    let mut buf = vec![0u8; 4096];
-    read(&mut client, &mut buf).await; // greeting
-    client
-        .write_all(b"EHLO client\r\nMAIL FROM:<a@b>\r\n")
-        .await
-        .unwrap();
-    let mut got = Vec::new();
-    while got.iter().filter(|&&b| b == b'\n').count() < 2 {
-        let n = read(&mut client, &mut buf).await;
-        got.extend_from_slice(&buf[..n]);
-    }
-
+    let (mut client, task) = spawn(Panicky, cfg(), None);
+    expect(&mut client, b"220").await;
+    send(&mut client, b"EHLO client\r\n", b"250").await;
+    send(&mut client, b"MAIL FROM:<a@b>\r\n", b"250").await;
     client.write_all(b"RCPT TO:<c@d>\r\n").await.unwrap();
-    let n = read(&mut client, &mut buf).await;
-    assert!(buf[..n].starts_with(b"421"));
-    assert_eq!(
-        read(&mut client, &mut buf).await,
-        0,
-        "connection must close"
-    );
-
-    task.await.expect("task panicked").expect("serve failed");
-}
-
-async fn expect(client: &mut tokio::io::DuplexStream, prefix: &[u8]) {
-    let mut buf = vec![0u8; 4096];
-    let n = read(client, &mut buf).await;
-    assert!(
-        buf[..n].starts_with(prefix),
-        "expected {prefix:?}, got {:?}",
-        String::from_utf8_lossy(&buf[..n])
-    );
-}
-
-async fn rest(client: &mut tokio::io::DuplexStream) -> String {
-    let mut out = Vec::new();
-    client.read_to_end(&mut out).await.expect("read to EOF");
-    String::from_utf8(out).unwrap()
+    assert!(rest(&mut client).await.starts_with("421"));
+    join(task).await;
 }
 
 #[tokio::test]
 async fn shutdown_closes_idle_connection_with_421() {
-    let (mut client, server) = tokio::io::duplex(4096);
     let (trigger, rx) = smtp_server::shutdown_signal();
-    let mut handler = Echo;
-    let task = tokio::spawn(async move {
-        smtp_server::serve(server, &mut handler, cfg(), TlsMode::None, Some(rx)).await
-    });
-
+    let (mut client, task) = spawn(Echo, cfg(), Some(rx));
     expect(&mut client, b"220").await;
     trigger.trigger();
     assert!(rest(&mut client).await.starts_with("421 4.3.2"));
-    task.await.expect("task panicked").expect("serve failed");
+    join(task).await;
 }
 
 #[tokio::test]
 async fn shutdown_lets_message_in_flight_finish() {
-    let (mut client, server) = tokio::io::duplex(4096);
     let (trigger, rx) = smtp_server::shutdown_signal();
-    let mut handler = Echo;
-    let task = tokio::spawn(async move {
-        smtp_server::serve(server, &mut handler, cfg(), TlsMode::None, Some(rx)).await
-    });
-
-    expect(&mut client, b"220").await;
-    for (cmd, reply) in [
-        (&b"EHLO client\r\n"[..], &b"250"[..]),
-        (b"MAIL FROM:<a@b>\r\n", b"250"),
-        (b"RCPT TO:<c@d>\r\n", b"250"),
-        (b"DATA\r\n", b"354"),
-    ] {
-        client.write_all(cmd).await.unwrap();
-        expect(&mut client, reply).await;
-    }
+    let (mut client, task) = spawn(Echo, cfg(), Some(rx));
+    envelope(&mut client).await;
+    send(&mut client, b"DATA\r\n", b"354").await;
     client.write_all(b"partial\r\n").await.unwrap();
     trigger.trigger();
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -231,68 +169,44 @@ async fn shutdown_lets_message_in_flight_finish() {
     let tail = rest(&mut client).await;
     assert!(tail.starts_with("250"), "{tail:?}");
     assert!(tail.contains("\r\n421 4.3.2"), "{tail:?}");
-    task.await.expect("task panicked").expect("serve failed");
+    join(task).await;
 }
 
 #[tokio::test]
 async fn connection_after_shutdown_gets_421_after_greeting() {
-    let (mut client, server) = tokio::io::duplex(4096);
     let (trigger, rx) = smtp_server::shutdown_signal();
     trigger.trigger();
-    let mut handler = Echo;
-    let task = tokio::spawn(async move {
-        smtp_server::serve(server, &mut handler, cfg(), TlsMode::None, Some(rx)).await
-    });
-
+    let (mut client, task) = spawn(Echo, cfg(), Some(rx));
     let all = rest(&mut client).await;
     assert!(
         all.starts_with("220") && all.contains("\r\n421 4.3.2"),
         "{all:?}"
     );
-    task.await.expect("task panicked").expect("serve failed");
+    join(task).await;
 }
 
 #[tokio::test]
 async fn dropped_trigger_does_not_shut_down() {
-    let (mut client, server) = tokio::io::duplex(4096);
     let (trigger, rx) = smtp_server::shutdown_signal();
     drop(trigger);
-    let mut handler = Echo;
-    let task = tokio::spawn(async move {
-        smtp_server::serve(server, &mut handler, cfg(), TlsMode::None, Some(rx)).await
-    });
-
+    let (mut client, task) = spawn(Echo, cfg(), Some(rx));
     expect(&mut client, b"220").await;
     tokio::time::sleep(Duration::from_millis(100)).await;
-    client.write_all(b"QUIT\r\n").await.unwrap();
-    expect(&mut client, b"221").await;
-    task.await.expect("task panicked").expect("serve failed");
+    send(&mut client, b"QUIT\r\n", b"221").await;
+    join(task).await;
 }
 
 #[tokio::test(start_paused = true)]
 async fn data_deadline_applies_while_discarding_oversize_message() {
-    let (mut client, server) = tokio::io::duplex(4096);
-    let mut c = Config::new(Hostname::new("mx.example.org").unwrap());
-    c.max_message_size = smtp_server::MessageSize::new(5);
-    c.command_timeout = Duration::from_secs(3600);
-    c.data_timeout = Duration::from_secs(30);
-    c.data_deadline = Duration::from_secs(60);
-    let mut handler = Echo;
-    let task = tokio::spawn(async move {
-        smtp_server::serve(server, &mut handler, Arc::new(c), TlsMode::None, None).await
+    let config = cfg_with(|c| {
+        c.max_message_size = smtp_server::MessageSize::new(5);
+        c.command_timeout = Duration::from_secs(3600);
+        c.data_timeout = Duration::from_secs(30);
+        c.data_deadline = Duration::from_secs(60);
     });
-
-    let mut buf = vec![0u8; 4096];
-    read(&mut client, &mut buf).await; // greeting
-    client
-        .write_all(b"EHLO client\r\nMAIL FROM:<a@b>\r\nRCPT TO:<c@d>\r\nDATA\r\n")
-        .await
-        .unwrap();
-    let mut got = Vec::new();
-    while !got.windows(3).any(|w| w == b"354") {
-        let n = read(&mut client, &mut buf).await;
-        got.extend_from_slice(&buf[..n]);
-    }
+    let (mut client, task) = spawn(Echo, config, None);
+    envelope(&mut client).await;
+    send(&mut client, b"DATA\r\n", b"354").await;
     // Exceed the limit, then trickle a byte every 20s: each read is within `data_timeout`, but
     // the overall deadline (60s) must still end the session.
     client.write_all(b"way more than five bytes").await.unwrap();
@@ -305,17 +219,10 @@ async fn data_deadline_applies_while_discarding_oversize_message() {
         }
         tokio::task::yield_now().await;
     }
-    let mut all = Vec::new();
-    loop {
-        let n = read(&mut client, &mut buf).await;
-        if n == 0 {
-            break;
-        }
-        all.extend_from_slice(&buf[..n]);
-    }
+    let all = rest(&mut client).await;
     assert!(closed, "deadline must close the session while discarding");
-    assert!(all.windows(3).any(|w| w == b"421"), "{all:?}");
-    task.await.expect("task panicked").expect("serve failed");
+    assert!(all.contains("421"), "{all:?}");
+    join(task).await;
 }
 
 struct Greeter(&'static str);
@@ -329,18 +236,14 @@ impl Handler for Greeter {
     }
 }
 
-async fn greeting_of(mut handler: impl Handler + 'static) -> Vec<u8> {
-    let (mut client, server) = tokio::io::duplex(4096);
-    let task = tokio::spawn(async move {
-        smtp_server::serve(server, &mut handler, cfg(), TlsMode::None, None).await
-    });
+async fn greeting_of(handler: impl Handler + 'static) -> Vec<u8> {
+    let (mut client, task) = spawn(handler, cfg(), None);
     let mut buf = vec![0u8; 4096];
     let n = read(&mut client, &mut buf).await;
-    let greeting = buf[..n].to_vec();
     client.write_all(b"QUIT\r\n").await.unwrap();
-    while read(&mut client, &mut buf).await != 0 {}
-    task.await.expect("task panicked").expect("serve failed");
-    greeting
+    rest(&mut client).await;
+    join(task).await;
+    buf[..n].to_vec()
 }
 
 #[tokio::test]
@@ -356,57 +259,39 @@ async fn handler_supplies_greeting_text() {
     assert_eq!(greeting_of(Echo).await, b"220 mx.example.org ESMTP\r\n");
 }
 
+struct Boom {
+    greeting: bool,
+}
+
+impl Handler for Boom {
+    async fn data_end(&mut self, _: &Envelope, _: Vec<u8>) -> Result<String, Rejection> {
+        Ok(String::new())
+    }
+    async fn greeting(&mut self) -> String {
+        if self.greeting {
+            panic!("boom");
+        }
+        String::new()
+    }
+    async fn rset(&mut self) {
+        panic!("boom")
+    }
+}
+
 #[tokio::test]
 async fn panicking_greeting_closes_with_421() {
-    struct Boom;
-    impl Handler for Boom {
-        async fn data_end(&mut self, _: &Envelope, _: Vec<u8>) -> Result<String, Rejection> {
-            Ok(String::new())
-        }
-        async fn greeting(&mut self) -> String {
-            panic!("boom")
-        }
-    }
-    let (mut client, server) = tokio::io::duplex(4096);
-    let task = tokio::spawn(async move {
-        smtp_server::serve(server, &mut Boom, cfg(), TlsMode::None, None).await
-    });
-    let mut out = Vec::new();
-    client.read_to_end(&mut out).await.unwrap();
-    assert!(
-        out.starts_with(b"421 "),
-        "{}",
-        String::from_utf8_lossy(&out)
-    );
-    task.await.expect("task panicked").expect("serve failed");
+    let (mut client, task) = spawn(Boom { greeting: true }, cfg(), None);
+    assert!(rest(&mut client).await.starts_with("421 "));
+    join(task).await;
 }
 
 #[tokio::test]
 async fn panicking_rset_closes_with_421() {
-    struct Boom;
-    impl Handler for Boom {
-        async fn data_end(&mut self, _: &Envelope, _: Vec<u8>) -> Result<String, Rejection> {
-            Ok(String::new())
-        }
-        async fn rset(&mut self) {
-            panic!("boom")
-        }
-    }
-    let (mut client, server) = tokio::io::duplex(4096);
-    let task = tokio::spawn(async move {
-        smtp_server::serve(server, &mut Boom, cfg(), TlsMode::None, None).await
-    });
-    let mut buf = vec![0u8; 4096];
-    read(&mut client, &mut buf).await;
+    let (mut client, task) = spawn(Boom { greeting: false }, cfg(), None);
+    expect(&mut client, b"220").await;
     client.write_all(b"RSET\r\n").await.unwrap();
-    let mut out = Vec::new();
-    client.read_to_end(&mut out).await.unwrap();
-    assert!(
-        out.starts_with(b"421 "),
-        "{}",
-        String::from_utf8_lossy(&out)
-    );
-    task.await.expect("task panicked").expect("serve failed");
+    assert!(rest(&mut client).await.starts_with("421 "));
+    join(task).await;
 }
 
 #[derive(Clone, Default)]
@@ -434,32 +319,18 @@ impl Handler for Streaming {
     }
 }
 
-type Serve = tokio::task::JoinHandle<std::io::Result<()>>;
-
 async fn streaming_session(
     config: Arc<Config>,
-    shutdown: Option<smtp_server::Shutdown>,
-) -> (tokio::io::DuplexStream, Serve, Counts) {
-    let (mut client, server) = tokio::io::duplex(4096);
+    shutdown: Option<Shutdown>,
+) -> (DuplexStream, Serve, Counts) {
     let counts = Counts::default();
-    let mut handler = Streaming(counts.clone());
-    let task = tokio::spawn(async move {
-        smtp_server::serve(server, &mut handler, config, TlsMode::None, shutdown).await
-    });
-    expect(&mut client, b"220").await;
-    for cmd in [
-        &b"EHLO client\r\n"[..],
-        b"MAIL FROM:<a@b>\r\n",
-        b"RCPT TO:<c@d>\r\n",
-    ] {
-        client.write_all(cmd).await.unwrap();
-        expect(&mut client, b"250").await;
-    }
+    let (mut client, task) = spawn(Streaming(counts.clone()), config, shutdown);
+    envelope(&mut client).await;
     (client, task, counts)
 }
 
 async fn finish(task: Serve, counts: &Counts) -> usize {
-    task.await.expect("task panicked").expect("serve failed");
+    join(task).await;
     counts.abort.load(Ordering::SeqCst)
 }
 
@@ -484,9 +355,8 @@ async fn abort_on_client_drop_between_bdat_chunks() {
 
 #[tokio::test(start_paused = true)]
 async fn abort_on_data_deadline_mid_data() {
-    let mut c = Config::new(Hostname::new("mx.example.org").unwrap());
-    c.data_deadline = Duration::from_secs(60);
-    let (mut client, task, counts) = streaming_session(Arc::new(c), None).await;
+    let config = cfg_with(|c| c.data_deadline = Duration::from_secs(60));
+    let (mut client, task, counts) = streaming_session(config, None).await;
     client.write_all(b"DATA\r\n").await.unwrap();
     expect(&mut client, b"354").await;
     client.write_all(b"partial\r\n").await.unwrap();
@@ -531,9 +401,8 @@ async fn no_abort_after_rset_mid_message() {
 
 #[tokio::test]
 async fn single_abort_after_oversize_then_disconnect() {
-    let mut c = Config::new(Hostname::new("mx.example.org").unwrap());
-    c.max_message_size = smtp_server::MessageSize::new(5);
-    let (mut client, task, counts) = streaming_session(Arc::new(c), None).await;
+    let config = cfg_with(|c| c.max_message_size = smtp_server::MessageSize::new(5));
+    let (mut client, task, counts) = streaming_session(config, None).await;
     client.write_all(b"DATA\r\n").await.unwrap();
     expect(&mut client, b"354").await;
     client
