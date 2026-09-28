@@ -267,3 +267,52 @@ async fn dropped_trigger_does_not_shut_down() {
     expect(&mut client, b"221").await;
     task.await.expect("task panicked").expect("serve failed");
 }
+
+#[tokio::test(start_paused = true)]
+async fn data_deadline_applies_while_discarding_oversize_message() {
+    let (mut client, server) = tokio::io::duplex(4096);
+    let mut c = Config::new(Hostname::new("mx.example.org").unwrap());
+    c.max_message_size = smtp_server::MessageSize::new(5);
+    c.command_timeout = Duration::from_secs(3600);
+    c.data_timeout = Duration::from_secs(30);
+    c.data_deadline = Duration::from_secs(60);
+    let mut handler = Echo;
+    let task = tokio::spawn(async move {
+        smtp_server::serve(server, &mut handler, Arc::new(c), TlsMode::None, None).await
+    });
+
+    let mut buf = vec![0u8; 4096];
+    read(&mut client, &mut buf).await; // greeting
+    client
+        .write_all(b"EHLO client\r\nMAIL FROM:<a@b>\r\nRCPT TO:<c@d>\r\nDATA\r\n")
+        .await
+        .unwrap();
+    let mut got = Vec::new();
+    while !got.windows(3).any(|w| w == b"354") {
+        let n = read(&mut client, &mut buf).await;
+        got.extend_from_slice(&buf[..n]);
+    }
+    // Exceed the limit, then trickle a byte every 20s: each read is within `data_timeout`, but
+    // the overall deadline (60s) must still end the session.
+    client.write_all(b"way more than five bytes").await.unwrap();
+    let mut closed = false;
+    for _ in 0..10 {
+        tokio::time::sleep(Duration::from_secs(20)).await;
+        if client.write_all(b"x").await.is_err() {
+            closed = true;
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    let mut all = Vec::new();
+    loop {
+        let n = read(&mut client, &mut buf).await;
+        if n == 0 {
+            break;
+        }
+        all.extend_from_slice(&buf[..n]);
+    }
+    assert!(closed, "deadline must close the session while discarding");
+    assert!(all.windows(3).any(|w| w == b"421"), "{all:?}");
+    task.await.expect("task panicked").expect("serve failed");
+}

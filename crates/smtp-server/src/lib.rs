@@ -38,6 +38,8 @@ pub struct Config {
     /// Advertised in the greeting and EHLO response.
     pub hostname: Hostname,
     /// `SIZE=` advertised (if set) and enforced against `MAIL FROM SIZE=` and the actual message.
+    /// `None` means unlimited, which is only safe with a streaming [`Handler::data_chunk`]:
+    /// the default handler buffers the whole message in memory. [`Config::new`] sets 25 MiB.
     pub max_message_size: Option<MessageSize>,
     /// Advertise `PIPELINING`.
     pub pipelining: bool,
@@ -51,6 +53,11 @@ pub struct Config {
     pub dsn: bool,
     /// Unrecognized/malformed commands allowed before the connection is closed with `421`.
     pub max_bad_commands: NonZeroU32,
+    /// Maximum recipients per transaction; further `RCPT TO` get `452 4.5.3`.
+    pub max_rcpts: NonZeroU32,
+    /// Maximum `NOOP`/`HELP`/`VRFY` commands per session before it is closed with `421`
+    /// (these never count as bad commands, so they would otherwise keep a session open forever).
+    pub max_idle_commands: NonZeroU32,
     /// Idle timeout while waiting for the next command.
     pub command_timeout: Duration,
     /// Idle timeout for a single read while inside `DATA`/`BDAT`.
@@ -60,17 +67,19 @@ pub struct Config {
 }
 
 impl Config {
-    /// A reasonable default configuration for `hostname`; no message size limit.
+    /// A reasonable default configuration for `hostname`; messages are limited to 25 MiB.
     pub fn new(hostname: Hostname) -> Self {
         Self {
             hostname,
-            max_message_size: None,
+            max_message_size: MessageSize::new(25 * 1024 * 1024),
             pipelining: true,
             chunking: true,
             smtputf8: true,
             eightbitmime: true,
             dsn: true,
             max_bad_commands: NonZeroU32::new(10).expect("10 != 0"),
+            max_rcpts: NonZeroU32::new(10).expect("10 != 0"),
+            max_idle_commands: NonZeroU32::new(100).expect("100 != 0"),
             command_timeout: Duration::from_secs(5 * 60),
             data_timeout: Duration::from_secs(3 * 60),
             data_deadline: Duration::from_secs(10 * 60),

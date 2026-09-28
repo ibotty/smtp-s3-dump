@@ -15,7 +15,7 @@ tracing = { version = "0.1", optional = true }
 mail-parser = "0.11"
 proptest = "1.11.0"
 rustls-pemfile = "2.2.0"
-tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "fs", "sync", "io-util"] }
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "fs", "sync", "io-util", "test-util"] }
 
 [features]
 default = ["tokio", "tracing"]

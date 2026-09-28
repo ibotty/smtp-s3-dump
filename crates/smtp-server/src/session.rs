@@ -12,7 +12,7 @@ use smtp_proto::{
 };
 
 use crate::Config;
-use crate::reply::Rejection;
+use crate::reply::{EnhancedCode, RejectCode, Rejection};
 use crate::types::{Envelope, Hostname, NonEmpty, Recipient, Sender};
 
 /// Bytes accumulated while receiving `DATA`/`BDAT`, and the receiver that
@@ -137,6 +137,7 @@ pub struct Session<T: Transport> {
     input: Vec<u8>,
     output: Vec<u8>,
     bad_commands: u32,
+    idle_commands: u32,
     _transport: PhantomData<T>,
 }
 
@@ -218,6 +219,7 @@ impl<T: Transport> Session<T> {
             input: Vec::new(),
             output,
             bad_commands: 0,
+            idle_commands: 0,
             _transport: PhantomData,
         }
     }
@@ -232,10 +234,10 @@ impl<T: Transport> Session<T> {
         std::mem::take(&mut self.output)
     }
 
-    /// Whether the session is currently receiving `DATA`/`BDAT` payload
-    /// bytes (used by drivers to pick an appropriate read timeout).
+    /// Whether the session is currently receiving (or discarding a rejected) `DATA`/`BDAT`
+    /// payload (used by drivers to pick an appropriate read timeout and overall deadline).
     pub fn in_data(&self) -> bool {
-        matches!(self.phase, Phase::Receiving { .. })
+        matches!(self.phase, Phase::Receiving { .. } | Phase::Discard { .. })
     }
 
     /// Anti-slowloris/command-timeout expiry: returns the final `421` bytes to write, then close.
@@ -280,6 +282,7 @@ impl<T: Transport> Session<T> {
             input: Vec::new(),
             output: Vec::new(),
             bad_commands: self.bad_commands,
+            idle_commands: self.idle_commands,
             _transport: PhantomData,
         }
     }
@@ -462,6 +465,15 @@ enum Dispatch<T: Transport> {
     Stop(Poll<T>),
 }
 
+fn too_many_rcpts() -> Rejection {
+    Rejection::new(
+        RejectCode::new(452).expect("452 is a valid code"),
+        EnhancedCode::new(4, 5, 3).expect("4.5.3 is a valid code"),
+        "too many recipients",
+    )
+    .expect("452 and 4.5.3 share class 4")
+}
+
 fn dispatch<T: Transport>(mut session: Session<T>, req: Request<String>) -> Dispatch<T> {
     match req {
         Request::Ehlo { host } | Request::Lhlo { host } => match Hostname::new(&host) {
@@ -509,6 +521,12 @@ fn dispatch<T: Transport>(mut session: Session<T>, req: Request<String>) -> Disp
         Request::Rcpt { to } => {
             if !matches!(session.phase, Phase::Mail { .. } | Phase::Rcpt { .. }) {
                 session.push_reply(&Rejection::bad_sequence("MAIL FROM required first"));
+                return Dispatch::Continue(session);
+            }
+            if let Phase::Rcpt { envelope } = &session.phase
+                && envelope.rcpts().len().get() >= session.cfg.max_rcpts.get() as usize
+            {
+                session.push_reply(&too_many_rcpts());
                 return Dispatch::Continue(session);
             }
             match Recipient::from_smtp(to, session.cfg.dsn) {
@@ -584,11 +602,19 @@ fn dispatch<T: Transport>(mut session: Session<T>, req: Request<String>) -> Disp
                 Dispatch::Continue(session)
             }
         }
+        Request::Noop { .. } | Request::Vrfy { .. } | Request::Help { .. }
+            if session.idle_commands >= session.cfg.max_idle_commands.get() =>
+        {
+            session.push_reply(&Rejection::closing("too many commands"));
+            Dispatch::Stop(Poll::Closed(session.take_output()))
+        }
         Request::Noop { .. } => {
+            session.idle_commands += 1;
             push_ok(&mut session.output, 250, (2, 0, 0), "OK");
             Dispatch::Continue(session)
         }
         Request::Vrfy { .. } => {
+            session.idle_commands += 1;
             push_ok(
                 &mut session.output,
                 252,
@@ -598,6 +624,7 @@ fn dispatch<T: Transport>(mut session: Session<T>, req: Request<String>) -> Disp
             Dispatch::Continue(session)
         }
         Request::Help { .. } => {
+            session.idle_commands += 1;
             push_ok(&mut session.output, 214, (2, 0, 0), "OK");
             Dispatch::Continue(session)
         }
@@ -1306,5 +1333,100 @@ mod tests {
             panic!("expected Quit event")
         };
         assert!(q.close().starts_with(b"221"));
+    }
+
+    #[test]
+    fn default_max_message_size_is_bounded() {
+        assert!(cfg().max_message_size.is_some());
+    }
+
+    #[test]
+    fn rcpt_over_max_rcpts_is_452() {
+        let cfg = cfg_with(|c| c.max_rcpts = std::num::NonZeroU32::new(2).unwrap());
+        let mut s = Session::<Cleartext>::new(cfg);
+        s.take_output();
+        s.feed(b"EHLO client\r\nMAIL FROM:<a@b>\r\nRCPT TO:<c@d>\r\nRCPT TO:<e@f>\r\n");
+        let Poll::Event(Event::Ehlo(req)) = s.poll() else {
+            panic!("expected Ehlo event")
+        };
+        let mut s = req.accept();
+        s.take_output();
+        let Poll::Event(Event::Mail(req)) = s.poll() else {
+            panic!("expected Mail event")
+        };
+        let mut s = req.accept();
+        s.take_output();
+        for _ in 0..2 {
+            let Poll::Event(Event::Rcpt(req)) = s.poll() else {
+                panic!("expected Rcpt event")
+            };
+            s = req.accept();
+        }
+        assert!(s.take_output().starts_with(b"250"));
+        s.feed(b"RCPT TO:<g@h>\r\n");
+        let Poll::NeedInput(mut s) = s.poll() else {
+            panic!("third RCPT must be rejected without an event")
+        };
+        let out = s.take_output();
+        assert!(
+            out.starts_with(b"452 4.5.3"),
+            "{:?}",
+            String::from_utf8_lossy(&out)
+        );
+        // Envelope is intact: DATA still works with the two accepted recipients.
+        s.feed(b"DATA\r\n");
+        assert!(matches!(s.poll(), Poll::Event(Event::DataStart(_))));
+    }
+
+    #[test]
+    fn discard_phase_counts_as_in_data() {
+        let cfg = cfg_with(|c| c.max_message_size = MessageSize::new(5));
+        let mut s = Session::<Cleartext>::new(cfg);
+        s.take_output();
+        s.feed(b"EHLO client\r\nMAIL FROM:<a@b>\r\nRCPT TO:<c@d>\r\nDATA\r\n");
+        let Poll::Event(Event::Ehlo(req)) = s.poll() else {
+            panic!("expected Ehlo event")
+        };
+        let s = req.accept();
+        let Poll::Event(Event::Mail(req)) = s.poll() else {
+            panic!("expected Mail event")
+        };
+        let s = req.accept();
+        let Poll::Event(Event::Rcpt(req)) = s.poll() else {
+            panic!("expected Rcpt event")
+        };
+        let s = req.accept();
+        let Poll::Event(Event::DataStart(req)) = s.poll() else {
+            panic!("expected DataStart event")
+        };
+        let mut s = req.accept();
+        s.feed(b"way more than five bytes");
+        let Poll::Event(Event::DataAbort(n)) = s.poll() else {
+            panic!("expected DataAbort event")
+        };
+        let Poll::NeedInput(s) = n.resume().poll() else {
+            panic!("expected NeedInput while discarding")
+        };
+        assert!(
+            s.in_data(),
+            "discarding must be covered by the data deadline"
+        );
+    }
+
+    #[test]
+    fn max_idle_commands_closes_with_421() {
+        let cfg = cfg_with(|c| c.max_idle_commands = std::num::NonZeroU32::new(2).unwrap());
+        let mut s = Session::<Cleartext>::new(cfg);
+        s.take_output();
+        s.feed(b"NOOP\r\nHELP\r\n");
+        let Poll::NeedInput(mut s) = s.poll() else {
+            panic!("expected NeedInput")
+        };
+        assert!(s.take_output().starts_with(b"250"));
+        s.feed(b"VRFY x\r\n");
+        let Poll::Closed(out) = s.poll() else {
+            panic!("expected Closed")
+        };
+        assert!(out.starts_with(b"421"));
     }
 }

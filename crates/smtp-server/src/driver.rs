@@ -5,7 +5,7 @@ use std::io;
 use std::panic::AssertUnwindSafe;
 use std::pin::pin;
 use std::sync::Arc;
-use std::time::Instant;
+use tokio::time::Instant;
 
 use futures_util::FutureExt;
 use futures_util::future::{Either, select};
