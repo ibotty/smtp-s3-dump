@@ -1,7 +1,5 @@
 //! Negative replies (4xx/5xx). Positive replies are built by the core only.
 
-use std::fmt;
-
 /// Replaces every control character (notably CR/LF) with a space, so reply text can
 /// never terminate its line early or inject further replies.
 pub(crate) fn sanitize_text(text: &str) -> String {
@@ -10,124 +8,26 @@ pub(crate) fn sanitize_text(text: &str) -> String {
         .collect()
 }
 
-/// The numeric SMTP reply code of a [`Rejection`]: 4xx (transient) or 5xx (permanent) only.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RejectCode(u16);
-
-impl RejectCode {
-    pub fn new(code: u16) -> Result<Self, InvalidRejection> {
-        match code {
-            400..=599 => Ok(Self(code)),
-            _ => Err(InvalidRejection("code must be 4xx or 5xx")),
-        }
-    }
-
-    pub fn get(&self) -> u16 {
-        self.0
-    }
-
-    fn class(&self) -> u8 {
-        (self.0 / 100) as u8
-    }
-}
-
-/// The enhanced status code (RFC 3463) of a [`Rejection`]: `class.subject.detail`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct EnhancedCode {
-    class: u8,
-    subject: u8,
-    detail: u8,
-}
-
-impl EnhancedCode {
-    pub fn new(class: u8, subject: u8, detail: u8) -> Result<Self, InvalidRejection> {
-        if !matches!(class, 4 | 5) || subject > 9 || detail > 9 {
-            return Err(InvalidRejection(
-                "enhanced code class must be 4 or 5, subject/detail 0..=9",
-            ));
-        }
-        Ok(Self {
-            class,
-            subject,
-            detail,
-        })
-    }
-
-    pub fn parts(&self) -> (u8, u8, u8) {
-        (self.class, self.subject, self.detail)
-    }
-}
-
-impl fmt::Display for EnhancedCode {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}.{}.{}", self.class, self.subject, self.detail)
-    }
-}
-
-/// Error returned by [`Rejection::new`], [`RejectCode::new`] and [`EnhancedCode::new`]:
-/// only 4xx/5xx codes with a matching enhanced-code class are valid rejections.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct InvalidRejection(pub(crate) &'static str);
-
-impl fmt::Display for InvalidRejection {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "invalid rejection: {}", self.0)
-    }
-}
-impl std::error::Error for InvalidRejection {}
-
 /// A negative (4xx/5xx) reply a [`crate::Handler`] can return to fail a step of the
 /// transaction. A 421 additionally closes the connection after it is sent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rejection {
-    code: RejectCode,
-    enhanced: EnhancedCode,
+    code: u16,
+    /// Enhanced status code (RFC 3463): `class.subject.detail`.
+    enhanced: (u8, u8, u8),
     text: String,
 }
 
 impl Rejection {
-    pub fn new(
-        code: RejectCode,
-        enhanced: EnhancedCode,
-        text: impl Into<String>,
-    ) -> Result<Self, InvalidRejection> {
-        if code.class() != enhanced.class {
-            return Err(InvalidRejection(
-                "reply code class must match enhanced code class",
-            ));
-        }
-        Ok(Self {
-            code,
-            enhanced,
-            text: sanitize_text(&text.into()),
-        })
-    }
-
-    pub fn code(&self) -> RejectCode {
-        self.code
-    }
-
-    pub fn enhanced(&self) -> EnhancedCode {
-        self.enhanced
-    }
-
-    pub fn text(&self) -> &str {
-        &self.text
-    }
-
     /// A 421 closes the session after being sent.
-    pub fn closes_session(&self) -> bool {
-        self.code.get() == 421
+    pub(crate) fn closes_session(&self) -> bool {
+        self.code == 421
     }
 
     fn build(code: u16, class: u8, subject: u8, detail: u8, text: impl Into<String>) -> Self {
         Self {
-            code: RejectCode(code),
-            enhanced: EnhancedCode {
-                class,
-                subject,
-                detail,
-            },
+            code,
+            enhanced: (class, subject, detail),
             text: sanitize_text(&text.into()),
         }
     }
@@ -222,10 +122,10 @@ impl Rejection {
     /// are replaced with spaces on construction; multi-line text is not supported.
     pub(crate) fn write(&self, out: &mut Vec<u8>) {
         let resp = smtp_proto::Response::new(
-            self.code.get(),
-            self.enhanced.class,
-            self.enhanced.subject,
-            self.enhanced.detail,
+            self.code,
+            self.enhanced.0,
+            self.enhanced.1,
+            self.enhanced.2,
             self.text.as_str(),
         );
         resp.write(out).expect("Vec<u8> writes are infallible");
@@ -235,28 +135,6 @@ impl Rejection {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn new_rejects_2xx_3xx() {
-        assert!(RejectCode::new(250).is_err());
-        assert!(RejectCode::new(354).is_err());
-        assert!(RejectCode::new(450).is_ok());
-        assert!(RejectCode::new(550).is_ok());
-    }
-
-    #[test]
-    fn new_rejects_class_mismatch() {
-        let code = RejectCode::new(450).unwrap();
-        let enhanced = EnhancedCode::new(5, 1, 1).unwrap();
-        assert!(Rejection::new(code, enhanced, "x").is_err());
-    }
-
-    #[test]
-    fn enhanced_code_rejects_bad_class() {
-        assert!(EnhancedCode::new(2, 0, 0).is_err());
-        assert!(EnhancedCode::new(4, 10, 0).is_err());
-    }
-
     use proptest::prelude::*;
 
     proptest! {
@@ -268,39 +146,7 @@ mod tests {
             prop_assert!(out.ends_with(b"\r\n"));
             let body = &out[..out.len() - 2];
             prop_assert!(!body.iter().any(|b| *b == b'\r' || *b == b'\n'));
-            let mut out2 = Vec::new();
-            Rejection::new(RejectCode::new(550).unwrap(), EnhancedCode::new(5, 1, 1).unwrap(), text)
-                .unwrap()
-                .write(&mut out2);
-            prop_assert_eq!(out2.iter().filter(|b| **b == b'\n').count(), 1);
-        }
-
-        #[test]
-        fn reject_code_roundtrips_or_errors(code: u16) {
-            if let Ok(rc) = RejectCode::new(code) {
-                prop_assert_eq!(rc.get(), code);
-                prop_assert!((4..=5).contains(&rc.class()));
-            }
-        }
-
-        #[test]
-        fn enhanced_code_roundtrips_or_errors(class: u8, subject: u8, detail: u8) {
-            if let Ok(ec) = EnhancedCode::new(class, subject, detail) {
-                prop_assert_eq!(ec.parts(), (class, subject, detail));
-                prop_assert!(class == 4 || class == 5);
-            }
-        }
-
-        #[test]
-        fn rejection_new_matches_class_invariant(
-            code in 400u16..=599,
-            class in 4u8..=5,
-            subject in 0u8..=9,
-            detail in 0u8..=9,
-        ) {
-            let rc = RejectCode::new(code).unwrap();
-            let ec = EnhancedCode::new(class, subject, detail).unwrap();
-            prop_assert_eq!(Rejection::new(rc, ec, "x").is_ok(), rc.class() == ec.parts().0);
+            prop_assert_eq!(out.iter().filter(|b| **b == b'\n').count(), 1);
         }
     }
 }
