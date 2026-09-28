@@ -113,10 +113,14 @@ async fn greet<T: Transport, H: Handler>(
     Ok(Session::with_greeting(cfg.clone(), &text))
 }
 
-async fn refuse<S: AsyncWrite + Unpin>(stream: &mut S, r: Rejection) -> io::Result<()> {
+fn render(r: &Rejection) -> Vec<u8> {
     let mut reply = Vec::new();
     r.write(&mut reply);
-    stream.write_all(&reply).await?;
+    reply
+}
+
+async fn refuse<S: AsyncWrite + Unpin>(stream: &mut S, r: Rejection) -> io::Result<()> {
+    stream.write_all(&render(&r)).await?;
     stream.shutdown().await
 }
 
@@ -172,7 +176,9 @@ where
             };
             stream.write_all(&start_tls.output()).await?;
             let mut stream = acceptor.accept(stream).await?;
-            handler.rset().await;
+            if let Err(r) = catch_panic(handler.rset()).await {
+                return refuse(&mut stream, r).await;
+            }
             run(
                 &mut stream,
                 start_tls.established(),
@@ -307,12 +313,18 @@ where
                 }
                 crate::Event::DataAbort(n) => {
                     message.clear();
-                    h.data_abort().await;
+                    if let Err(r) = catch_panic(h.data_abort()).await {
+                        stream.write_all(&render(&r)).await?;
+                        return Ok(None);
+                    }
                     n.resume()
                 }
                 crate::Event::Rset(n) => {
                     message.clear();
-                    h.rset().await;
+                    if let Err(r) = catch_panic(h.rset()).await {
+                        stream.write_all(&render(&r)).await?;
+                        return Ok(None);
+                    }
                     n.resume()
                 }
                 crate::Event::Quit(q) => {

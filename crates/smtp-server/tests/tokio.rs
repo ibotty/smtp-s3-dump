@@ -379,3 +379,31 @@ async fn panicking_greeting_closes_with_421() {
     );
     task.await.expect("task panicked").expect("serve failed");
 }
+
+#[tokio::test]
+async fn panicking_rset_closes_with_421() {
+    struct Boom;
+    impl Handler for Boom {
+        async fn data_end(&mut self, _: &Envelope, _: Vec<u8>) -> Result<String, Rejection> {
+            Ok(String::new())
+        }
+        async fn rset(&mut self) {
+            panic!("boom")
+        }
+    }
+    let (mut client, server) = tokio::io::duplex(4096);
+    let task = tokio::spawn(async move {
+        smtp_server::serve(server, &mut Boom, cfg(), TlsMode::None, None).await
+    });
+    let mut buf = vec![0u8; 4096];
+    read(&mut client, &mut buf).await;
+    client.write_all(b"RSET\r\n").await.unwrap();
+    let mut out = Vec::new();
+    client.read_to_end(&mut out).await.unwrap();
+    assert!(
+        out.starts_with(b"421 "),
+        "{}",
+        String::from_utf8_lossy(&out)
+    );
+    task.await.expect("task panicked").expect("serve failed");
+}
