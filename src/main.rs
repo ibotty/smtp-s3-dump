@@ -1,21 +1,17 @@
 use std::env;
-use std::net::SocketAddr;
 // use std::time::Duration;
 
 use anyhow::{Context, Result};
-use futures::{FutureExt, TryFutureExt};
-use smtpbis::{smtp_server, LoopExit};
 use sqlx::postgres::PgPoolOptions;
-use tokio::io::AsyncWriteExt;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio_rustls::TlsAcceptor;
 use tracing::instrument;
-use tracing::{debug, error, info, warn};
+use tracing::{info, warn};
 use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
-use crate::smtp::{SmtpBackend, SmtpSession};
+use crate::smtp::SmtpBackend;
 
 mod attachment;
 mod db;
@@ -127,44 +123,15 @@ async fn start_smtp_server(smtp_bind_addr: String, smtp_backend: SmtpBackend) ->
     info!("listening on {}", smtp_bind_addr);
     let listener = TcpListener::bind(smtp_bind_addr).await?;
 
-    // ignore smtpbis' shutdown
-    let (_shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-    let shutdown_rx = shutdown_rx.map_err(|_| ()).shared();
-
     while let Ok((socket, addr)) = listener.accept().await {
-        let session = smtp_backend.new_session()?;
-        let mut shutdown_rx = shutdown_rx.clone();
+        let mut session = smtp_backend.new_session()?;
+        let server_config = smtp_backend.server_config.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_smtp_connection(socket, addr, session, &mut shutdown_rx).await {
-                warn!("could not handle connection: {}", e);
+            let acceptor = TlsAcceptor::from(session.config.tls_config.clone());
+            if let Err(e) = smtp_server::serve(socket, &mut session, server_config, Some(acceptor)).await {
+                warn!("could not handle connection from {}: {}", addr, e);
             }
         });
-    }
-    Ok(())
-}
-
-#[instrument(skip_all)]
-async fn handle_smtp_connection(
-    mut socket: TcpStream,
-    _addr: SocketAddr,
-    mut session: SmtpSession,
-    shutdown: &mut smtpbis::ShutdownSignal,
-) -> Result<()> {
-    let mut smtp_config = smtpbis::Config::default();
-    match smtp_server(&mut socket, &mut session, &smtp_config, shutdown, true).await {
-        Ok(LoopExit::Done) => debug!("session done"),
-        Ok(LoopExit::STARTTLS(tls_config)) => {
-            let acceptor = TlsAcceptor::from(tls_config);
-            let mut tls_socket = acceptor.accept(socket).await?;
-            smtp_config.enable_starttls = false;
-            // handler.tls_started(tls_socket.get_ref().1).await;
-            match smtp_server(&mut tls_socket, &mut session, &smtp_config, shutdown, false).await {
-                Ok(_) => debug!("TLS session done"),
-                Err(e) => error!("TLS session error: {:?}", e),
-            }
-            tls_socket.shutdown().await?;
-        }
-        Err(_e) => {}
     }
     Ok(())
 }

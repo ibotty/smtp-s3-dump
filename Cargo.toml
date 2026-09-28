@@ -10,10 +10,8 @@ license = "GPL-3.0-or-later" # due to smtpbis
 [dependencies]
 anyhow = "1"
 arc-swap = "1.6.0"
-async-trait = "0.1.73"
 aws-config = { version = "1", features = ["behavior-version-latest"] }
 aws-sdk-s3 = "1"
-bytes = "1"
 futures = "0.3.28"
 mail-parser = "0.11"
 mime_guess = "2"
@@ -21,9 +19,7 @@ notify = { version = "8", default-features = false }
 notify-debouncer-mini = { version = "0.7", default-features = false }
 rustls-pemfile = "2"
 serde_json = "1.0.107"
-rustyknife = { git = "https://github.com/ibotty/rustyknife" }
-# smtpbis = { path = "../smtpbis" }
-# smtpbis = { git = "https://github.com/ibotty/smtpbis", branch = "master" }
+smtp-server = { path = "crates/smtp-server" }
 sqlx = { version = "0.9", features = ["runtime-tokio", "tls-rustls", "postgres"] }
 thiserror = "2"
 tokio = { version = "1", features = ["tracing", "macros", "rt-multi-thread", "signal"] }
@@ -35,10 +31,3 @@ tracing-subscriber = { version = "0.3.17", features = ["env-filter", "std", "reg
 
 [profile.release]
 strip = true
-
-[patch.crates-io]
-rustyknife = { git = "https://github.com/ibotty/rustyknife" }
-
-[dependencies.smtpbis]
-git = "https://github.com/ibotty/smtpbis"
-branch = "master"
