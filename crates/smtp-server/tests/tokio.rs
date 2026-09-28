@@ -1,6 +1,7 @@
 //! Driver integration tests, running the real Tokio event loop over `tokio::io::duplex`.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use smtp_server::{Config, Envelope, Handler, Hostname, Recipient, Rejection, Sender, TlsMode};
@@ -406,4 +407,142 @@ async fn panicking_rset_closes_with_421() {
         String::from_utf8_lossy(&out)
     );
     task.await.expect("task panicked").expect("serve failed");
+}
+
+#[derive(Clone, Default)]
+struct Counts {
+    abort: Arc<AtomicUsize>,
+    rset: Arc<AtomicUsize>,
+    end: Arc<AtomicUsize>,
+}
+
+struct Streaming(Counts);
+
+impl Handler for Streaming {
+    async fn data_chunk(&mut self, _: &[u8], _: &mut Vec<u8>) -> Result<(), Rejection> {
+        Ok(())
+    }
+    async fn data_end(&mut self, _: &Envelope, _: Vec<u8>) -> Result<String, Rejection> {
+        self.0.end.fetch_add(1, Ordering::SeqCst);
+        Ok(String::new())
+    }
+    async fn data_abort(&mut self) {
+        self.0.abort.fetch_add(1, Ordering::SeqCst);
+    }
+    async fn rset(&mut self) {
+        self.0.rset.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+type Serve = tokio::task::JoinHandle<std::io::Result<()>>;
+
+async fn streaming_session(
+    config: Arc<Config>,
+    shutdown: Option<smtp_server::Shutdown>,
+) -> (tokio::io::DuplexStream, Serve, Counts) {
+    let (mut client, server) = tokio::io::duplex(4096);
+    let counts = Counts::default();
+    let mut handler = Streaming(counts.clone());
+    let task = tokio::spawn(async move {
+        smtp_server::serve(server, &mut handler, config, TlsMode::None, shutdown).await
+    });
+    expect(&mut client, b"220").await;
+    for cmd in [
+        &b"EHLO client\r\n"[..],
+        b"MAIL FROM:<a@b>\r\n",
+        b"RCPT TO:<c@d>\r\n",
+    ] {
+        client.write_all(cmd).await.unwrap();
+        expect(&mut client, b"250").await;
+    }
+    (client, task, counts)
+}
+
+async fn finish(task: Serve, counts: &Counts) -> usize {
+    task.await.expect("task panicked").expect("serve failed");
+    counts.abort.load(Ordering::SeqCst)
+}
+
+#[tokio::test]
+async fn abort_on_client_drop_mid_data() {
+    let (mut client, task, counts) = streaming_session(cfg(), None).await;
+    client.write_all(b"DATA\r\n").await.unwrap();
+    expect(&mut client, b"354").await;
+    client.write_all(b"partial\r\n").await.unwrap();
+    drop(client);
+    assert_eq!(finish(task, &counts).await, 1);
+}
+
+#[tokio::test]
+async fn abort_on_client_drop_between_bdat_chunks() {
+    let (mut client, task, counts) = streaming_session(cfg(), None).await;
+    client.write_all(b"BDAT 5\r\nhello").await.unwrap();
+    expect(&mut client, b"250").await;
+    drop(client);
+    assert_eq!(finish(task, &counts).await, 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn abort_on_data_deadline_mid_data() {
+    let mut c = Config::new(Hostname::new("mx.example.org").unwrap());
+    c.data_deadline = Duration::from_secs(60);
+    let (mut client, task, counts) = streaming_session(Arc::new(c), None).await;
+    client.write_all(b"DATA\r\n").await.unwrap();
+    expect(&mut client, b"354").await;
+    client.write_all(b"partial\r\n").await.unwrap();
+    assert!(rest(&mut client).await.starts_with("421"));
+    assert_eq!(finish(task, &counts).await, 1);
+}
+
+#[tokio::test]
+async fn abort_on_shutdown_between_bdat_chunks() {
+    let (trigger, rx) = smtp_server::shutdown_signal();
+    let (mut client, task, counts) = streaming_session(cfg(), Some(rx)).await;
+    client.write_all(b"BDAT 5\r\nhello").await.unwrap();
+    expect(&mut client, b"250").await;
+    trigger.trigger();
+    assert!(rest(&mut client).await.starts_with("421 4.3.2"));
+    assert_eq!(finish(task, &counts).await, 1);
+}
+
+#[tokio::test]
+async fn no_abort_after_normal_data_end() {
+    let (mut client, task, counts) = streaming_session(cfg(), None).await;
+    client.write_all(b"DATA\r\n").await.unwrap();
+    expect(&mut client, b"354").await;
+    client.write_all(b"hello\r\n.\r\n").await.unwrap();
+    expect(&mut client, b"250").await;
+    drop(client);
+    assert_eq!(finish(task, &counts).await, 0);
+    assert_eq!(counts.end.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn no_abort_after_rset_mid_message() {
+    let (mut client, task, counts) = streaming_session(cfg(), None).await;
+    client.write_all(b"BDAT 5\r\nhello").await.unwrap();
+    expect(&mut client, b"250").await;
+    client.write_all(b"RSET\r\n").await.unwrap();
+    expect(&mut client, b"250").await;
+    drop(client);
+    assert_eq!(finish(task, &counts).await, 0);
+    assert_eq!(counts.rset.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn single_abort_after_oversize_then_disconnect() {
+    let mut c = Config::new(Hostname::new("mx.example.org").unwrap());
+    c.max_message_size = smtp_server::MessageSize::new(5);
+    let (mut client, task, counts) = streaming_session(Arc::new(c), None).await;
+    client.write_all(b"DATA\r\n").await.unwrap();
+    expect(&mut client, b"354").await;
+    client
+        .write_all(b"way more than five bytes\r\n")
+        .await
+        .unwrap();
+    while counts.abort.load(Ordering::SeqCst) == 0 {
+        tokio::task::yield_now().await;
+    }
+    drop(client);
+    assert_eq!(finish(task, &counts).await, 1);
 }

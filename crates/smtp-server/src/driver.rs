@@ -73,12 +73,15 @@ pub trait Handler: Send {
     }
     /// The message is complete. `message` is whatever [`Handler::data_chunk`] left in the buffer
     /// (the whole message, unless streaming). The returned string becomes part of the `250` reply.
+    /// On `Err` or a panic the implementation must clean up any resources itself, since
+    /// [`Handler::data_abort`] is not called after `data_end`.
     fn data_end(
         &mut self,
         env: &Envelope,
         message: Vec<u8>,
     ) -> impl Future<Output = Result<String, Rejection>> + Send;
-    /// The in-progress message was aborted (oversize, or a rejected chunk); clean up.
+    /// The in-progress message was aborted (oversize, or a rejected chunk), or the connection
+    /// ended before the message completed; clean up.
     fn data_abort(&mut self) -> impl Future<Output = ()> + Send {
         async {}
     }
@@ -210,13 +213,35 @@ async fn shutdown_requested(shutdown: &mut Option<Shutdown>) {
 }
 
 /// Drives `session` to completion; returns `Some(start_tls)` only when the client asked for
-/// (and this transport offers) `STARTTLS`.
+/// (and this transport offers) `STARTTLS`. Calls [`Handler::data_abort`] if the connection ends
+/// while a message is open.
 async fn run<S, T, H>(
+    stream: &mut S,
+    session: Session<T>,
+    h: &mut H,
+    cfg: &Config,
+    shutdown: &mut Option<Shutdown>,
+) -> io::Result<Option<T::StartTls>>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+    T: Transport,
+    H: Handler,
+{
+    let mut message_open = false;
+    let result = run_inner(stream, session, h, cfg, shutdown, &mut message_open).await;
+    if message_open {
+        let _ = catch_panic(h.data_abort()).await;
+    }
+    result
+}
+
+async fn run_inner<S, T, H>(
     stream: &mut S,
     mut session: Session<T>,
     h: &mut H,
     cfg: &Config,
     shutdown: &mut Option<Shutdown>,
+    message_open: &mut bool,
 ) -> io::Result<Option<T::StartTls>>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
@@ -288,6 +313,7 @@ where
                 }
                 crate::Event::DataStart(req) => {
                     let r = catch(h.data_start(req.envelope())).await;
+                    *message_open = r.is_ok();
                     req.decide(r)
                 }
                 crate::Event::DataChunk(req) => {
@@ -304,6 +330,7 @@ where
                     } else {
                         catch(h.data_chunk(&last, &mut message)).await
                     };
+                    *message_open = false;
                     let env = req.envelope().clone();
                     let r = match r {
                         Ok(()) => catch(h.data_end(&env, std::mem::take(&mut message))).await,
@@ -312,6 +339,7 @@ where
                     req.decide(r)
                 }
                 crate::Event::DataAbort(n) => {
+                    *message_open = false;
                     message.clear();
                     if let Err(r) = catch_panic(h.data_abort()).await {
                         stream.write_all(&render(&r)).await?;
@@ -320,6 +348,7 @@ where
                     n.resume()
                 }
                 crate::Event::Rset(n) => {
+                    *message_open = false;
                     message.clear();
                     if let Err(r) = catch_panic(h.rset()).await {
                         stream.write_all(&render(&r)).await?;
