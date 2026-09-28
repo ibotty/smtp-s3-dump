@@ -13,7 +13,7 @@ use smtp_proto::{
 
 use crate::Config;
 use crate::reply::{EnhancedCode, RejectCode, Rejection};
-use crate::types::{Envelope, Hostname, NonEmpty, Recipient, Sender};
+use crate::types::{Domain, Envelope, NonEmpty, Recipient, Sender};
 
 /// Bytes accumulated while receiving `DATA`/`BDAT`, and the receiver that
 /// unstuffs/counts them. Abstracts over the two wire formats smtp-proto
@@ -476,14 +476,14 @@ fn too_many_rcpts() -> Rejection {
 
 fn dispatch<T: Transport>(mut session: Session<T>, req: Request<String>) -> Dispatch<T> {
     match req {
-        Request::Ehlo { host } | Request::Lhlo { host } => match Hostname::new(&host) {
+        Request::Ehlo { host } | Request::Lhlo { host } => match Domain::parse_client(&host) {
             Ok(host) => Dispatch::Stop(Poll::Event(Event::Ehlo(EhloRequest { session, host }))),
             Err(_) => {
                 session.push_reply(&Rejection::syntax_error("invalid EHLO domain"));
                 Dispatch::Continue(session)
             }
         },
-        Request::Helo { host } => match Hostname::new(&host) {
+        Request::Helo { host } => match Domain::parse_client(&host) {
             Ok(host) => Dispatch::Stop(Poll::Event(Event::Helo(HeloRequest { session, host }))),
             Err(_) => {
                 session.push_reply(&Rejection::syntax_error("invalid HELO domain"));
@@ -642,12 +642,12 @@ fn dispatch<T: Transport>(mut session: Session<T>, req: Request<String>) -> Disp
 /// `EHLO` request; decide whether to accept it.
 pub struct EhloRequest<T: Transport> {
     session: Session<T>,
-    host: Hostname,
+    host: Domain,
 }
 
 impl<T: Transport> EhloRequest<T> {
-    /// The peer-supplied hostname.
-    pub fn host(&self) -> &Hostname {
+    /// The peer-supplied domain (hostname or address literal).
+    pub fn host(&self) -> &Domain {
         &self.host
     }
 
@@ -678,12 +678,12 @@ impl<T: Transport> EhloRequest<T> {
 /// `HELO` request; decide whether to accept it.
 pub struct HeloRequest<T: Transport> {
     session: Session<T>,
-    host: Hostname,
+    host: Domain,
 }
 
 impl<T: Transport> HeloRequest<T> {
-    /// The peer-supplied hostname.
-    pub fn host(&self) -> &Hostname {
+    /// The peer-supplied domain (hostname or address literal).
+    pub fn host(&self) -> &Domain {
         &self.host
     }
 
@@ -1014,7 +1014,7 @@ impl StartTlsToken {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::MessageSize;
+    use crate::{Hostname, MessageSize};
 
     fn cfg() -> Arc<Config> {
         Arc::new(Config::new(Hostname::new("mx.example.org").unwrap()))
@@ -1034,6 +1034,65 @@ mod tests {
     fn greeting_is_queued_immediately() {
         let mut s = Session::<Cleartext>::new(cfg());
         assert!(s.take_output().starts_with(b"220 mx.example.org ESMTP\r\n"));
+    }
+
+    fn ehlo_host(line: &[u8]) -> Option<Domain> {
+        let mut s = Session::<Cleartext>::new(cfg());
+        s.take_output();
+        s.feed(line);
+        match s.poll() {
+            Poll::Event(Event::Ehlo(req)) => Some(req.host().clone()),
+            Poll::NeedInput(mut s) => {
+                assert!(s.take_output().starts_with(b"501"), "{line:?}");
+                None
+            }
+            _ => panic!("unexpected poll result for {line:?}"),
+        }
+    }
+
+    #[test]
+    fn ehlo_accepts_literals_and_underscores() {
+        assert_eq!(
+            ehlo_host(b"EHLO [1.2.3.4]\r\n"),
+            Some(Domain::Literal("1.2.3.4".parse().unwrap()))
+        );
+        assert_eq!(
+            ehlo_host(b"EHLO [IPv6:::1]\r\n"),
+            Some(Domain::Literal("::1".parse().unwrap()))
+        );
+        assert_eq!(
+            ehlo_host(b"EHLO [IPv6:2001:db8::1]\r\n"),
+            Some(Domain::Literal("2001:db8::1".parse().unwrap()))
+        );
+        let h = ehlo_host(b"EHLO my_host.example\r\n").unwrap();
+        assert_eq!(h.to_string(), "my_host.example");
+    }
+
+    #[test]
+    fn helo_accepts_literals_and_underscores() {
+        for line in [&b"HELO [1.2.3.4]\r\n"[..], b"HELO my_host.example\r\n"] {
+            let mut s = Session::<Cleartext>::new(cfg());
+            s.take_output();
+            s.feed(line);
+            assert!(matches!(s.poll(), Poll::Event(Event::Helo(_))), "{line:?}");
+        }
+    }
+
+    #[test]
+    fn ehlo_rejects_garbage_with_501() {
+        for line in [
+            &b"EHLO [1.2.3]\r\n"[..],
+            b"EHLO [::1]\r\n",
+            b"EHLO [IPv6:1.2.3.4]\r\n",
+            b"EHLO a\x01b\r\n",
+            b"EHLO a\x00\r\n",
+            b"EHLO a\x7f\r\n",
+            b"EHLO -a_b\r\n",
+            b"EHLO a..b\r\n",
+            b"EHLO \xc3\xa9.example\r\n",
+        ] {
+            assert_eq!(ehlo_host(line), None, "{line:?}");
+        }
     }
 
     #[test]

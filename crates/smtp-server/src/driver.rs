@@ -26,14 +26,14 @@ pub trait Handler: Send {
     /// React to `EHLO`.
     fn ehlo(
         &mut self,
-        _host: &crate::Hostname,
+        _host: &crate::Domain,
     ) -> impl Future<Output = Result<(), Rejection>> + Send {
         async { Ok(()) }
     }
     /// React to `HELO`.
     fn helo(
         &mut self,
-        _host: &crate::Hostname,
+        _host: &crate::Domain,
     ) -> impl Future<Output = Result<(), Rejection>> + Send {
         async { Ok(()) }
     }

@@ -4,7 +4,7 @@
 //! the validated data.
 
 use std::fmt;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::num::NonZeroUsize;
 
 use smtp_proto::{MailFrom, RcptTo};
@@ -12,6 +12,11 @@ use smtp_proto::{MailFrom, RcptTo};
 use crate::reply::Rejection;
 
 /// A validated DNS hostname: LDH labels, at most 253 bytes, no empty labels.
+///
+/// [`Hostname::new`] is strict (letters, digits, hyphen). Hostnames inside a
+/// client-supplied EHLO/HELO [`Domain`] are additionally allowed to contain `_`
+/// in labels, since real clients send such names; they are never ASCII-unsafe
+/// (no whitespace, control characters or non-ASCII).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Hostname(String);
 
@@ -27,7 +32,12 @@ impl fmt::Display for InvalidHostname {
 impl std::error::Error for InvalidHostname {}
 
 impl Hostname {
+    /// Strict LDH hostname.
     pub fn new(s: &str) -> Result<Self, InvalidHostname> {
+        Self::parse(s, false)
+    }
+
+    fn parse(s: &str, allow_underscore: bool) -> Result<Self, InvalidHostname> {
         if s.is_empty() || s.len() > 253 {
             return Err(InvalidHostname("length must be 1..=253"));
         }
@@ -40,7 +50,7 @@ impl Hostname {
             }
             if !label
                 .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || (allow_underscore && b == b'_'))
             {
                 return Err(InvalidHostname(
                     "label must be LDH (letters, digits, hyphen)",
@@ -61,7 +71,8 @@ impl fmt::Display for Hostname {
     }
 }
 
-/// The domain part of a mailbox: a hostname, or an address literal (`[1.2.3.4]`, `[IPv6:::1]`).
+/// A domain: a hostname, or an address literal (`[1.2.3.4]`, `[IPv6:::1]`). Used for
+/// the domain part of a mailbox and for the client-supplied EHLO/HELO argument.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Domain {
     Name(Hostname),
@@ -79,16 +90,34 @@ impl fmt::Display for Domain {
 }
 
 impl Domain {
+    /// Mailbox domain: strict LDH hostname or RFC 5321 address literal.
     pub(crate) fn parse(s: &str) -> Result<Self, InvalidHostname> {
-        if let Some(inner) = s.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
-            let addr = inner.strip_prefix("IPv6:").unwrap_or(inner);
-            inner
-                .parse::<IpAddr>()
-                .or_else(|_| addr.parse::<IpAddr>())
-                .map(Domain::Literal)
-                .map_err(|_| InvalidHostname("invalid address literal"))
-        } else {
-            Hostname::new(s).map(Domain::Name)
+        Self::parse_with(s, false)
+    }
+
+    /// Client-supplied EHLO/HELO domain: like [`Domain::parse`], but hostname
+    /// labels may contain `_`.
+    pub(crate) fn parse_client(s: &str) -> Result<Self, InvalidHostname> {
+        Self::parse_with(s, true)
+    }
+
+    /// Literals per RFC 5321 §4.1.3: `[a.b.c.d]` or `[IPv6:...]` only.
+    fn parse_with(s: &str, allow_underscore: bool) -> Result<Self, InvalidHostname> {
+        let Some(inner) = s.strip_prefix('[') else {
+            return Hostname::parse(s, allow_underscore).map(Domain::Name);
+        };
+        let bad = || InvalidHostname("invalid address literal");
+        let inner = inner.strip_suffix(']').ok_or_else(bad)?;
+        match inner.split_once(':') {
+            Some((tag, v6)) if tag.eq_ignore_ascii_case("IPv6") => v6
+                .parse::<Ipv6Addr>()
+                .map(|ip| Domain::Literal(ip.into()))
+                .map_err(|_| bad()),
+            Some(_) => Err(bad()),
+            None => inner
+                .parse::<Ipv4Addr>()
+                .map(|ip| Domain::Literal(ip.into()))
+                .map_err(|_| bad()),
         }
     }
 }
@@ -603,6 +632,91 @@ mod tests {
     }
 
     #[test]
+    fn domain_literal_table() {
+        for ok in [
+            "[1.2.3.4]",
+            "[203.0.113.7]",
+            "[IPv6:::1]",
+            "[IPv6:2001:db8::1]",
+            "[IPv6:::ffff:1.2.3.4]",
+            "[ipv6:::1]",
+        ] {
+            assert!(
+                matches!(Domain::parse(ok), Ok(Domain::Literal(_))),
+                "{ok:?}"
+            );
+            assert!(
+                matches!(Domain::parse_client(ok), Ok(Domain::Literal(_))),
+                "{ok:?}"
+            );
+        }
+        for bad in [
+            "[]",
+            "[",
+            "[1.2.3.4",
+            "[1.2.3]",
+            "[1.2.3.4.5]",
+            "[256.1.1.1]",
+            "[::1]",
+            "[2001:db8::1]",
+            "[IPv6:1.2.3.4]",
+            "[IPv6:]",
+            "[IPv6:::1",
+            "[IPv4:1.2.3.4]",
+            "[IPv6 :::1]",
+            "[ 1.2.3.4]",
+            "[1.2.3.4 ]",
+            "[1.2.3.4]x",
+            "[IPv6:fe80::1%eth0]",
+            "[1.2.3.4\r\n]",
+            "[[1.2.3.4]]",
+        ] {
+            assert!(Domain::parse(bad).is_err(), "{bad:?}");
+            assert!(Domain::parse_client(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn client_domain_allows_underscore_only_when_lenient() {
+        for ok in ["my_host.example", "_dmarc.example.org", "a_b", "a_"] {
+            assert!(
+                matches!(Domain::parse_client(ok), Ok(Domain::Name(_))),
+                "{ok:?}"
+            );
+            assert!(Domain::parse(ok).is_err(), "{ok:?}");
+            assert!(Hostname::new(ok).is_err(), "{ok:?}");
+        }
+        let long_label = format!("{}.example", "a".repeat(64));
+        let long_name = format!("{}.{}", "a".repeat(63), "b_".repeat(100));
+        for bad in [
+            "",
+            ".",
+            "a..b",
+            ".a",
+            "a.",
+            "-a_b",
+            "a_b-",
+            "a b",
+            "a\tb",
+            "a\x00",
+            "a\r\n",
+            "a\x7f",
+            "é_x",
+            "a_é",
+            "a\u{85}",
+            "a:b",
+            "a@b",
+            long_label.as_str(),
+            long_name.as_str(),
+        ] {
+            assert!(Domain::parse_client(bad).is_err(), "{bad:?}");
+        }
+        assert!(Domain::parse_client(&format!("{}.example", "a_".repeat(31))).is_ok());
+        assert!(Domain::parse_client(&format!("{}.example", "_".repeat(63))).is_ok());
+        assert!(Domain::parse_client(&"a".repeat(254)).is_err());
+    }
+
+    #[test]
     fn mailbox_splits_on_unquoted_at() {
         let m = Mailbox::parse("foo@example.org").unwrap();
         assert_eq!(m.local().as_str(), "foo");
@@ -690,6 +804,13 @@ mod tests {
         proptest::string::string_regex(r#"[a-zA-Z0-9@.\x22\\ \x00-\x1f-]{0,20}"#).unwrap()
     }
 
+    fn domain_string() -> impl Strategy<Value = String> {
+        proptest::string::string_regex(
+            r#"[a-zA-Z0-9.:\[\]_ \x00-\x1f\x7f\u{80}-\u{9f}é-]{0,20}|\[(IPv6:)?[0-9a-f:.]{0,20}\]"#,
+        )
+        .unwrap()
+    }
+
     fn local_part_string() -> impl Strategy<Value = String> {
         proptest::string::string_regex(r#"[a-z0-9@.\x22\\ /!#\x00-\x1f\x7f\u{80}-\u{9f}é-]{0,20}"#)
             .unwrap()
@@ -700,6 +821,22 @@ mod tests {
         fn hostname_new_no_panic_and_roundtrips(s in smtp_ish_string()) {
             if let Ok(h) = Hostname::new(&s) {
                 prop_assert!(Hostname::new(&h.to_string()).is_ok());
+            }
+        }
+
+        #[test]
+        fn client_domain_no_panic_and_roundtrips(s in domain_string()) {
+            if let Ok(d) = Domain::parse_client(&s) {
+                prop_assert_eq!(Domain::parse_client(&d.to_string()), Ok(d.clone()));
+                prop_assert!(d.to_string().bytes().all(|b| b.is_ascii_graphic()));
+            }
+        }
+
+        #[test]
+        fn mailbox_domain_no_panic_and_roundtrips(s in domain_string()) {
+            if let Ok(d) = Domain::parse(&s) {
+                prop_assert_eq!(Domain::parse(&d.to_string()), Ok(d.clone()));
+                prop_assert!(Domain::parse_client(&s).is_ok());
             }
         }
 
