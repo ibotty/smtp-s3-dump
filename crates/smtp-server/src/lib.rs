@@ -21,8 +21,9 @@ pub use session::{
     Transport,
 };
 pub use types::{
-    Domain, Envelope, ForwardPath, Hostname, InvalidHostname, InvalidLocalPart, LocalPart, Mailbox,
-    MessageSize, NonEmpty, Recipient, ReversePath, Sender,
+    Body, Domain, EnvId, Envelope, ForwardPath, Hostname, InvalidHostname, InvalidLocalPart,
+    LocalPart, Mailbox, MessageSize, NonEmpty, Notify, OriginalRecipient, Recipient, Ret,
+    ReversePath, Sender,
 };
 
 #[cfg(feature = "tokio")]
