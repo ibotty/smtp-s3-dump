@@ -3,7 +3,7 @@ members = [".", "crates/smtp-server"]
 
 [package]
 name = "smtp-s3-dump"
-version = "0.5.1"
+version = "0.5.2"
 edition = "2021"
 
 description = "SMTP server that dumps received mail to S3"
