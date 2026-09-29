@@ -1,6 +1,6 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-  "extends": ["config:recommended", "helpers:pinGitHubActionDigestsToSemver", "security:openssf-scorecard"],
+  "extends": ["config:recommended", "helpers:pinGitHubActionDigestsToSemver", "security:openssf-scorecard", "docker:pinDigests"],
   "lockFileMaintenance": { "enabled": true, "automerge": true },
   "minimumReleaseAge": "7 days",
   "packageRules": [

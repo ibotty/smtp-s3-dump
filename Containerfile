@@ -14,5 +14,5 @@ EXPOSE 2525/tcp
 
 COPY $BINARY /smtp-s3-dump
 
-CMD /smtp-s3-dump
 USER 1000
+CMD ["/smtp-s3-dump"]
