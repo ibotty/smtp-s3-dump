@@ -14,14 +14,24 @@ permissions:
 
 jobs:
   check-ci:
-    name: Look for a passing CI run
+    name: Check tag and look for a passing CI run
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
+      contents: read
       actions: read
     outputs:
       passed: ${{ steps.runs.outputs.passed }}
     steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: false
+
+    - name: Check Cargo.toml version matches tag
+      run: |
+        version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+        [ "v$version" = "$GITHUB_REF_NAME" ] || { echo "Cargo.toml version $version does not match tag $GITHUB_REF_NAME" >&2; exit 1; }
+
     - id: runs
       run: |
         echo "passed=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow ci.yml --commit "$GITHUB_SHA" --status success --json databaseId,event --jq '[.[] | select(.event != "schedule")] | length')" >> "$GITHUB_OUTPUT"
@@ -122,9 +132,7 @@ jobs:
     - name: Get version from Cargo.toml
       id: version
       run: |
-        version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
-        [ "v$version" = "$GITHUB_REF_NAME" ] || { echo "Cargo.toml version $version does not match tag $GITHUB_REF_NAME" >&2; exit 1; }
-        echo "version=$version" >> "$GITHUB_OUTPUT"
+        echo "version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)" >> "$GITHUB_OUTPUT"
         echo "sha=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
 
     - name: Build container
