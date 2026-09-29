@@ -21,3 +21,6 @@ tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "fs", "s
 default = ["tokio", "tracing"]
 tokio = ["dep:tokio", "dep:tokio-rustls", "dep:futures-util"]
 tracing = ["dep:tracing"]
+
+[package.metadata.release]
+release = false
