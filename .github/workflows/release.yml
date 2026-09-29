@@ -121,14 +121,18 @@ jobs:
 
     - name: Get version from Cargo.toml
       id: version
-      run: echo "version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)" >> "$GITHUB_OUTPUT"
+      run: |
+        version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+        [ "v$version" = "$GITHUB_REF_NAME" ] || { echo "Cargo.toml version $version does not match tag $GITHUB_REF_NAME" >&2; exit 1; }
+        echo "version=$version" >> "$GITHUB_OUTPUT"
+        echo "sha=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
 
     - name: Build container
       id: build-image
       uses: redhat-actions/buildah-build@719e3c40d8af9790c23eca13f7daa339f2867034 # v3.1.0
       with:
         image: ${{ env.IMAGE_NAME }}
-        tags: "${{ github.ref_name }} latest"
+        tags: "${{ github.ref_name }} ${{ steps.version.outputs.version }} sha-${{ steps.version.outputs.sha }} latest"
         archs: amd64
         oci: true
         containerfiles: ./Containerfile
