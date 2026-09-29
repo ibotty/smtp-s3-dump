@@ -6,8 +6,11 @@ name = "smtp-s3-dump"
 version = "0.5.1"
 edition = "2021"
 
+description = "SMTP server that dumps received mail to S3"
+repository = "https://github.com/ibotty/smtp-s3-dump"
 license = "GPL-3.0-or-later"
 publish = false
+exclude = ["todo/"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
