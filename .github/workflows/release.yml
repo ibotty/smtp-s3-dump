@@ -64,6 +64,7 @@ jobs:
     if: ${{ needs.check-ci.outputs.passed == '0' }}
     permissions:
       contents: read
+      checks: write
     uses: $/.github/workflows/ci.yml
 
   build:
