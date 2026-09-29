@@ -14,7 +14,7 @@ mod limit;
 #[cfg(feature = "tokio")]
 mod shutdown;
 
-pub use reply::Rejection;
+pub use reply::{EnhancedCode, InvalidRejection, RejectCode, Rejection};
 pub use session::{
     Cleartext, DataChunkRequest, DataEndRequest, DataStartRequest, EhloRequest, Event, HeloRequest,
     MailRequest, Plain, Poll, QuitToken, RcptRequest, ResumeToken, Session, StartTlsToken, Tls,
