@@ -6,7 +6,7 @@ use std::time::Instant;
 use mail_parser::{Message, MessageParser};
 use smtp_server::{Envelope, ForwardPath, Handler, Recipient, Rejection, ReversePath, Sender};
 use sqlx::PgPool;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::db;
 use crate::s3;
@@ -51,19 +51,27 @@ impl MailEvent {
     }
 
     fn emit(self, outcome: &'static str) {
-        info!(
-            peer = %self.peer,
-            from = %self.from,
-            rcpts = ?self.rcpts,
-            rejected = ?self.rejected,
-            size = self.size,
-            message_id = self.message_id.as_deref(),
-            stored = self.stored,
-            outcome,
-            error = self.error.as_deref(),
-            duration_ms = self.started.elapsed().as_millis() as u64,
-            "mail"
-        );
+        macro_rules! log {
+            ($level:ident) => {
+                $level!(
+                    peer = %self.peer,
+                    from = %self.from,
+                    rcpts = ?self.rcpts,
+                    rejected = ?self.rejected,
+                    size = self.size,
+                    message_id = self.message_id.as_deref(),
+                    stored = self.stored,
+                    outcome,
+                    error = self.error.as_deref(),
+                    duration_ms = self.started.elapsed().as_millis() as u64,
+                    "mail"
+                )
+            };
+        }
+        match outcome {
+            "rejected" | "reset" | "failed" | "invalid" => log!(warn),
+            _ => log!(info),
+        }
     }
 }
 
@@ -154,7 +162,7 @@ impl Handler for SmtpSession {
 
     async fn rset(&mut self) {
         if let Some(ev) = self.event.take() {
-            ev.emit("reset");
+            ev.emit("rset");
         }
     }
 }
