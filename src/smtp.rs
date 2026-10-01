@@ -155,6 +155,13 @@ impl Handler for SmtpSession {
         }
     }
 
+    async fn rejected(&mut self, rejection: &Rejection) {
+        match &mut self.event {
+            Some(ev) => ev.rejected.push(rejection.to_string()),
+            None => warn!(peer = %self.peer, rejection = %rejection, "command rejected"),
+        }
+    }
+
     async fn data_abort(&mut self) {
         if let Some(ev) = self.event.take() {
             ev.emit("aborted");

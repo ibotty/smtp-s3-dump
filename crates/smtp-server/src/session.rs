@@ -1,6 +1,7 @@
 //! The Sans-IO SMTP core: a state machine driven by [`Session::feed`] and
 //! [`Session::poll`]. No I/O happens here; see [`crate::serve`] for a driver.
 
+use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::io::Write;
 use std::marker::PhantomData;
@@ -133,6 +134,7 @@ pub struct Session<T: Transport> {
     command: RequestReceiver,
     input: Vec<u8>,
     output: Vec<u8>,
+    notices: VecDeque<Rejection>,
     bad_commands: u32,
     idle_commands: u32,
     _transport: PhantomData<T>,
@@ -177,6 +179,9 @@ pub enum Event<T: Transport> {
     DataAbort(ResumeToken<T>),
     /// `RSET`; clean up any partial state, then call `.resume()`.
     Rset(ResumeToken<T>),
+    /// The session itself rejected a command (syntax, parameters, sequence, limits) without
+    /// consulting the handler. Purely informational; call `.resume()`.
+    Rejected(RejectedToken<T>),
     /// `QUIT`; call `.close()` to get the final bytes to write, then stop.
     Quit(QuitToken<T>),
     /// `STARTTLS` (only reachable when `T = Plain`).
@@ -227,6 +232,7 @@ impl<T: Transport> Session<T> {
             command: RequestReceiver::default(),
             input: Vec::new(),
             output,
+            notices: VecDeque::new(),
             bad_commands: 0,
             idle_commands: 0,
             _transport: PhantomData,
@@ -266,14 +272,19 @@ impl<T: Transport> Session<T> {
         self.output
     }
 
+    /// Sends a rejection the session made itself, and queues an [`Event::Rejected`] for it
+    /// (unless it closes the connection: that one is reported through [`Poll::Closed`]).
     fn push_reply(&mut self, r: &Rejection) {
         r.write(&mut self.output);
+        if !r.closes_session() {
+            self.notices.push_back(r.clone());
+        }
     }
 
     /// Sends `r`, then either continues in `otherwise` or, for a `421`, arms the connection
     /// to close on the next [`Session::poll`].
     fn reply_and_continue(&mut self, r: &Rejection, otherwise: Phase) {
-        self.push_reply(r);
+        r.write(&mut self.output);
         self.phase = if r.closes_session() {
             Phase::Closing(r.clone())
         } else {
@@ -296,6 +307,7 @@ impl<T: Transport> Session<T> {
             // survive the upgrade (defense against STARTTLS command injection).
             input: Vec::new(),
             output: Vec::new(),
+            notices: VecDeque::new(),
             bad_commands: self.bad_commands,
             idle_commands: self.idle_commands,
             _transport: PhantomData,
@@ -337,6 +349,12 @@ impl<T: Transport> Session<T> {
 
     /// Advances the state machine as far as possible with the bytes fed so far.
     pub fn poll(mut self) -> Poll<T> {
+        if let Some(rejection) = self.notices.pop_front() {
+            return Poll::Event(Event::Rejected(RejectedToken {
+                session: self,
+                rejection,
+            }));
+        }
         match std::mem::replace(&mut self.phase, Phase::Fresh) {
             Phase::Closing(r) => Poll::Closed(self.take_output(), r),
             Phase::Receiving {
@@ -365,6 +383,9 @@ impl<T: Transport> Session<T> {
                         Dispatch::Continue(s) => self = s,
                         Dispatch::Stop(p) => return p,
                     }
+                    if !self.notices.is_empty() {
+                        return self.poll();
+                    }
                 }
                 Err(ParseError::NeedsMoreData { .. }) => {
                     self.input.clear();
@@ -377,8 +398,9 @@ impl<T: Transport> Session<T> {
                     if self.bad_commands >= self.cfg.max_bad_commands.get() {
                         let r = Rejection::too_many_bad_commands();
                         self.push_reply(&r);
-                        return Poll::Closed(self.take_output(), r);
+                        self.phase = Phase::Closing(r);
                     }
+                    return self.poll();
                 }
             }
         }
@@ -415,10 +437,9 @@ impl<T: Transport> Session<T> {
         if let Some(limit) = self.cfg.max_message_size
             && size > limit.get()
         {
-            self.phase = Phase::Discard {
-                receiver,
-                reply: Rejection::too_big(),
-            };
+            let reply = Rejection::too_big();
+            self.notices.push_back(reply.clone());
+            self.phase = Phase::Discard { receiver, reply };
             return Poll::Event(Event::DataAbort(ResumeToken {
                 session: self,
                 ack: false,
@@ -939,6 +960,23 @@ impl<T: Transport> ResumeToken<T> {
     }
 }
 
+/// The session rejected a command on its own; call [`RejectedToken::resume`].
+pub struct RejectedToken<T: Transport> {
+    session: Session<T>,
+    rejection: Rejection,
+}
+
+impl<T: Transport> RejectedToken<T> {
+    /// The rejection that was already queued for the client.
+    pub fn rejection(&self) -> &Rejection {
+        &self.rejection
+    }
+
+    pub fn resume(self) -> Session<T> {
+        self.session
+    }
+}
+
 /// `QUIT`; call [`QuitToken::close`] to get the final bytes to write.
 pub struct QuitToken<T: Transport> {
     session: Session<T>,
@@ -978,6 +1016,15 @@ impl StartTlsToken {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn poll<T: Transport>(mut s: Session<T>) -> Poll<T> {
+        loop {
+            match s.poll() {
+                Poll::Event(Event::Rejected(t)) => s = t.resume(),
+                other => return other,
+            }
+        }
+    }
     use crate::{Hostname, MessageSize};
 
     fn cfg() -> Arc<Config> {
@@ -997,7 +1044,7 @@ mod tests {
         s.take_output();
         s.feed(input);
         loop {
-            s = match s.poll() {
+            s = match poll(s) {
                 Poll::Event(Event::Ehlo(r)) => r.accept(),
                 Poll::Event(Event::Mail(r)) => r.accept(),
                 Poll::Event(Event::Rcpt(r)) => r.accept(),
@@ -1021,7 +1068,7 @@ mod tests {
         let mut s = Session::<Cleartext>::new(cfg());
         s.take_output();
         s.feed(line);
-        match s.poll() {
+        match poll(s) {
             Poll::Event(Event::Ehlo(req)) => Some(req.host().clone()),
             Poll::NeedInput(mut s) => {
                 assert!(s.take_output().starts_with(b"501"), "{line:?}");
@@ -1067,7 +1114,7 @@ mod tests {
             let mut s = Session::<Cleartext>::new(cfg());
             s.take_output();
             s.feed(line);
-            assert!(matches!(s.poll(), Poll::Event(Event::Helo(_))), "{line:?}");
+            assert!(matches!(poll(s), Poll::Event(Event::Helo(_))), "{line:?}");
         }
     }
 
@@ -1093,7 +1140,7 @@ mod tests {
         let mut s = Session::<Plain>::new(cfg());
         s.take_output();
         s.feed(b"EHLO client.example\r\n");
-        let Poll::Event(Event::Ehlo(req)) = s.poll() else {
+        let Poll::Event(Event::Ehlo(req)) = poll(s) else {
             panic!("expected Ehlo event")
         };
         let mut s = req.accept();
@@ -1104,7 +1151,7 @@ mod tests {
         let mut s = Session::<Cleartext>::new(cfg());
         s.take_output();
         s.feed(b"EHLO client.example\r\n");
-        let Poll::Event(Event::Ehlo(req)) = s.poll() else {
+        let Poll::Event(Event::Ehlo(req)) = poll(s) else {
             panic!("expected Ehlo event")
         };
         let out = req.accept().take_output();
@@ -1123,6 +1170,40 @@ mod tests {
         assert_eq!(env.sender().env_id().unwrap().as_str(), "x+q");
         let orcpt = env.rcpts().first().orcpt().unwrap();
         assert_eq!((orcpt.addr_type(), orcpt.addr()), ("rfc822", "c@d"));
+    }
+
+    #[test]
+    fn library_rejection_is_reported_before_the_next_event() {
+        let mut s = Session::<Cleartext>::new(cfg());
+        s.take_output();
+        s.feed(b"EHLO client\r\nMAIL FROM:<a@b>\r\nRCPT TO:<c@d> NOTIFY=NEVER,SUCCESS\r\nRSET\r\n");
+        let s = loop {
+            s = match s.poll() {
+                Poll::Event(Event::Ehlo(r)) => r.accept(),
+                Poll::Event(Event::Mail(r)) => r.accept(),
+                Poll::Event(Event::Rejected(t)) => {
+                    assert_eq!(t.rejection().code().get(), 501);
+                    break t.resume();
+                }
+                _ => panic!("expected Rejected before Rset"),
+            }
+        };
+        assert!(matches!(s.poll(), Poll::Event(Event::Rset(_))));
+    }
+
+    #[test]
+    fn handler_rejection_and_closing_421_are_not_reported_as_rejected() {
+        let mut s = Session::<Cleartext>::new(cfg());
+        s.take_output();
+        s.feed(b"EHLO client\r\nMAIL FROM:<a@b>\r\n");
+        let Poll::Event(Event::Ehlo(r)) = s.poll() else {
+            panic!("expected Ehlo")
+        };
+        let Poll::Event(Event::Mail(r)) = r.accept().poll() else {
+            panic!("expected Mail")
+        };
+        let s = r.reject(Rejection::transient("no"));
+        assert!(matches!(s.poll(), Poll::NeedInput(_)));
     }
 
     #[test]
@@ -1158,16 +1239,16 @@ mod tests {
         // Chunks may arrive as they're parsed (mirroring the driver's `data_chunk` buffering).
         let mut message = Vec::new();
         s.feed(b"Subject: hi\r\n..still one dot\r\n");
-        let Poll::Event(Event::DataChunk(chunk)) = s.poll() else {
+        let Poll::Event(Event::DataChunk(chunk)) = poll(s) else {
             panic!("expected DataChunk event")
         };
         message.extend_from_slice(chunk.chunk());
         let s = chunk.accept();
-        let Poll::NeedInput(mut s) = s.poll() else {
+        let Poll::NeedInput(mut s) = poll(s) else {
             panic!("expected NeedInput before terminator")
         };
         s.feed(b".\r\n");
-        let Poll::Event(Event::DataEnd(mut req)) = s.poll() else {
+        let Poll::Event(Event::DataEnd(mut req)) = poll(s) else {
             panic!("expected DataEnd event")
         };
         message.extend_from_slice(&req.take_message());
@@ -1198,15 +1279,15 @@ mod tests {
         let mut s = req.accept();
         s.take_output();
         s.feed(b"way more than five bytes");
-        let Poll::Event(Event::DataAbort(n)) = s.poll() else {
+        let Poll::Event(Event::DataAbort(n)) = poll(s) else {
             panic!("expected DataAbort event")
         };
         let s = n.resume();
-        let Poll::NeedInput(mut s) = s.poll() else {
+        let Poll::NeedInput(mut s) = poll(s) else {
             panic!("expected NeedInput while discarding")
         };
         s.feed(b"\r\n.\r\n");
-        let Poll::NeedInput(mut s) = s.poll() else {
+        let Poll::NeedInput(mut s) = poll(s) else {
             panic!("expected NeedInput after 552")
         };
         assert!(s.take_output().starts_with(b"552"));
@@ -1222,11 +1303,11 @@ mod tests {
         };
 
         s.feed(b"BDAT 5\r\nhello");
-        let Poll::Event(Event::DataStart(req)) = s.poll() else {
+        let Poll::Event(Event::DataStart(req)) = poll(s) else {
             panic!("expected DataStart event")
         };
         let s = req.accept();
-        let Poll::Event(Event::DataChunk(chunk)) = s.poll() else {
+        let Poll::Event(Event::DataChunk(chunk)) = poll(s) else {
             panic!("expected DataChunk event")
         };
         assert_eq!(chunk.chunk(), b"hello");
@@ -1234,7 +1315,7 @@ mod tests {
         assert!(s.take_output().starts_with(b"250"));
 
         s.feed(b"BDAT 3 LAST\r\nbye");
-        let Poll::Event(Event::DataEnd(mut req)) = s.poll() else {
+        let Poll::Event(Event::DataEnd(mut req)) = poll(s) else {
             panic!("expected DataEnd event")
         };
         assert_eq!(req.take_message(), b"bye");
@@ -1256,7 +1337,7 @@ mod tests {
         let mut s = Session::<Plain>::new(cfg());
         s.take_output();
         s.feed(b"EHLO client\r\nSTARTTLS\r\nMAIL FROM:<injected@evil>\r\n");
-        let Poll::Event(Event::Ehlo(req)) = s.poll() else {
+        let Poll::Event(Event::Ehlo(req)) = poll(s) else {
             panic!("expected Ehlo event")
         };
         let Poll::Event(Event::StartTls(mut tls)) = req.accept().poll() else {
@@ -1264,11 +1345,11 @@ mod tests {
         };
         assert!(tls.output().ends_with(b"220 2.0.0 Ready to start TLS\r\n"));
         let s: Session<Tls> = tls.established();
-        let Poll::NeedInput(mut s) = s.poll() else {
+        let Poll::NeedInput(mut s) = poll(s) else {
             panic!("injected MAIL must be gone")
         };
         s.feed(b"MAIL FROM:<a@b>\r\n");
-        let Poll::NeedInput(mut s) = s.poll() else {
+        let Poll::NeedInput(mut s) = poll(s) else {
             panic!("expected NeedInput")
         };
         assert!(s.take_output().starts_with(b"503"));
@@ -1279,7 +1360,7 @@ mod tests {
         let mut s = Session::<Cleartext>::new(cfg());
         s.take_output();
         s.feed(b"STARTTLS\r\n");
-        let Poll::NeedInput(mut s) = s.poll() else {
+        let Poll::NeedInput(mut s) = poll(s) else {
             panic!("expected NeedInput")
         };
         assert!(s.take_output().starts_with(b"502"));
@@ -1291,7 +1372,7 @@ mod tests {
         let mut s = Session::<Cleartext>::new(cfg);
         s.take_output();
         s.feed(b"NOTACOMMAND\r\nNOTACOMMAND\r\n");
-        let Poll::Closed(out, _) = s.poll() else {
+        let Poll::Closed(out, _) = poll(s) else {
             panic!("expected Closed")
         };
         assert!(out.starts_with(b"500"));
@@ -1303,20 +1384,20 @@ mod tests {
         let mut s = Session::<Cleartext>::new(cfg());
         s.take_output();
         s.feed(b"NOOP\r\n");
-        let Poll::NeedInput(mut s) = s.poll() else {
+        let Poll::NeedInput(mut s) = poll(s) else {
             panic!("expected NeedInput")
         };
         assert!(s.take_output().starts_with(b"250"));
 
         s.feed(b"RSET\r\n");
-        let Poll::Event(Event::Rset(n)) = s.poll() else {
+        let Poll::Event(Event::Rset(n)) = poll(s) else {
             panic!("expected Rset event")
         };
         let mut s = n.resume();
         assert!(s.take_output().starts_with(b"250"));
 
         s.feed(b"QUIT\r\n");
-        let Poll::Event(Event::Quit(q)) = s.poll() else {
+        let Poll::Event(Event::Quit(q)) = poll(s) else {
             panic!("expected Quit event")
         };
         assert!(q.close().starts_with(b"221"));
@@ -1330,7 +1411,7 @@ mod tests {
             panic!("expected NeedInput")
         };
         s.feed(b"RCPT TO:<g@h>\r\n");
-        let Poll::NeedInput(mut s) = s.poll() else {
+        let Poll::NeedInput(mut s) = poll(s) else {
             panic!("third RCPT must be rejected without an event")
         };
         let out = s.take_output();
@@ -1341,7 +1422,7 @@ mod tests {
         );
         // Envelope is intact: DATA still works with the two accepted recipients.
         s.feed(b"DATA\r\n");
-        assert!(matches!(s.poll(), Poll::Event(Event::DataStart(_))));
+        assert!(matches!(poll(s), Poll::Event(Event::DataStart(_))));
     }
 
     #[test]
@@ -1355,10 +1436,10 @@ mod tests {
         };
         let mut s = req.accept();
         s.feed(b"way more than five bytes");
-        let Poll::Event(Event::DataAbort(n)) = s.poll() else {
+        let Poll::Event(Event::DataAbort(n)) = poll(s) else {
             panic!("expected DataAbort event")
         };
-        let Poll::NeedInput(s) = n.resume().poll() else {
+        let Poll::NeedInput(s) = poll(n.resume()) else {
             panic!("expected NeedInput while discarding")
         };
         assert!(
@@ -1373,12 +1454,12 @@ mod tests {
         let mut s = Session::<Cleartext>::new(cfg);
         s.take_output();
         s.feed(b"NOOP\r\nHELP\r\n");
-        let Poll::NeedInput(mut s) = s.poll() else {
+        let Poll::NeedInput(mut s) = poll(s) else {
             panic!("expected NeedInput")
         };
         assert!(s.take_output().starts_with(b"250"));
         s.feed(b"VRFY x\r\n");
-        let Poll::Closed(out, _) = s.poll() else {
+        let Poll::Closed(out, _) = poll(s) else {
             panic!("expected Closed")
         };
         assert!(out.starts_with(b"421"));

@@ -17,8 +17,8 @@ mod shutdown;
 pub use reply::{EnhancedCode, InvalidRejection, RejectCode, Rejection};
 pub use session::{
     Cleartext, DataChunkRequest, DataEndRequest, DataStartRequest, EhloRequest, Event, HeloRequest,
-    MailRequest, Plain, Poll, QuitToken, RcptRequest, ResumeToken, Session, StartTlsToken, Tls,
-    Transport,
+    MailRequest, Plain, Poll, QuitToken, RcptRequest, RejectedToken, ResumeToken, Session,
+    StartTlsToken, Tls, Transport,
 };
 pub use types::{
     Body, Domain, EnvId, Envelope, ForwardPath, Hostname, InvalidHostname, InvalidLocalPart,

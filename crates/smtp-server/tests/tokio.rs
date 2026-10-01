@@ -92,6 +92,37 @@ async fn envelope(client: &mut DuplexStream) {
     }
 }
 
+struct Rejects(Arc<std::sync::Mutex<Vec<String>>>);
+
+impl Handler for Rejects {
+    async fn rejected(&mut self, r: &Rejection) {
+        self.0.lock().unwrap().push(r.to_string());
+    }
+    async fn data_end(&mut self, _env: &Envelope, _msg: Vec<u8>) -> Result<String, Rejection> {
+        Ok(String::new())
+    }
+}
+
+#[tokio::test]
+async fn handler_is_told_about_library_rejections() {
+    let seen = Arc::default();
+    let (mut client, task) = spawn(Rejects(Arc::clone(&seen)), cfg(), None);
+    expect(&mut client, b"220").await;
+    send(&mut client, b"EHLO client\r\n", b"250").await;
+    send(&mut client, b"MAIL FROM:<a@b>\r\n", b"250").await;
+    send(
+        &mut client,
+        b"RCPT TO:<c@d> NOTIFY=NEVER,SUCCESS\r\n",
+        b"501",
+    )
+    .await;
+    send(&mut client, b"QUIT\r\n", b"221").await;
+    join(task).await;
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 1, "{seen:?}");
+    assert!(seen[0].starts_with("501 "), "{seen:?}");
+}
+
 #[tokio::test]
 async fn buffered_transaction_with_two_recipients() {
     let (mut client, task) = spawn(Echo, cfg(), None);

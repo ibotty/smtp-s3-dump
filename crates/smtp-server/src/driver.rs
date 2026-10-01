@@ -89,6 +89,13 @@ pub trait Handler: Send {
     fn rset(&mut self) -> impl Future<Output = ()> + Send {
         async {}
     }
+    /// The server rejected a command itself, without consulting this handler (syntax or
+    /// parameter errors, bad sequence, limits, oversize messages). Informational only; the reply
+    /// was already queued. Rejections the handler returned, and the `421` that closes a
+    /// connection (see [`Error::Closed`]), are not reported here.
+    fn rejected(&mut self, _rejection: &Rejection) -> impl Future<Output = ()> + Send {
+        async {}
+    }
 }
 
 async fn catch_panic<F: Future>(fut: F) -> Result<F::Output, Rejection> {
@@ -367,6 +374,13 @@ where
                     *message_open = false;
                     message.clear();
                     if let Err(r) = catch_panic(h.rset()).await {
+                        stream.write_all(&render(&r)).await?;
+                        return Err(Error::Closed(r));
+                    }
+                    n.resume()
+                }
+                crate::Event::Rejected(n) => {
+                    if let Err(r) = catch_panic(h.rejected(n.rejection())).await {
                         stream.write_all(&render(&r)).await?;
                         return Err(Error::Closed(r));
                     }

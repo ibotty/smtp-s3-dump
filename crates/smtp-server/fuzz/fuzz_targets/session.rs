@@ -30,6 +30,7 @@ fn drive(mut session: Session<Plain>, data: &[u8]) -> Option<Session<Plain>> {
             Poll::Event(Event::DataEnd(req)) => req.decide(Err(Rejection::transient("no"))),
             Poll::Event(Event::DataAbort(token)) => token.resume(),
             Poll::Event(Event::Rset(token)) => token.resume(),
+            Poll::Event(Event::Rejected(token)) => token.resume(),
             Poll::Event(Event::Quit(token)) => {
                 let _ = token.close();
                 return None;
