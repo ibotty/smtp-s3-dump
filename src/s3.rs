@@ -295,7 +295,7 @@ mod tests {
     }
 
     #[test]
-    fn plans_attachment_wire_bytes_and_metadata() {
+    fn plans_attachment_bytes_and_metadata() {
         let p = plan("a@b", "c@d", EML).unwrap();
         let bodies: Vec<_> = p.uploads[..3].iter().map(|u| u.body.as_slice()).collect();
         assert_eq!(bodies, [&[0u8, 1, 2, 3][..], b"hi", &[1]]);

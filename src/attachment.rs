@@ -1,11 +1,12 @@
-//! Byte-preserving extraction of e-mail attachments.
+//! Extraction of e-mail attachments that preserves the original bytes, except for
+//! CRLF line breaks in text parts.
 //!
 //! `mail-parser` classifies any `Content-Type: text/*` MIME part as `PartType::Text`,
 //! decoding it into a UTF-8 `String` while parsing (see `mail_parser::parsers::message`).
 //! That's correct for message bodies, but wrong for attachments such as CSV files:
 //!
-//! - quoted-printable decoding canonicalizes line breaks to CRLF, even when the
-//!   original attachment only used LF,
+//! - quoted-printable decoding yields CRLF line breaks, even when the original
+//!   attachment only used LF (`attachment_bytes` converts them back to LF),
 //! - a missing/unrecognized `charset` falls back to `String::from_utf8_lossy`,
 //!   replacing every non-UTF-8 byte (e.g. Latin-1 'ä' = 0xE4) with U+FFFD,
 //! - and `MessagePart::contents()` always returns the decoded string re-encoded as
@@ -17,18 +18,37 @@
 
 use mail_parser::decoders::base64::base64_decode;
 use mail_parser::decoders::quoted_printable::quoted_printable_decode;
-use mail_parser::{Encoding, Message, MessagePart};
+use mail_parser::{Encoding, Message, MessagePart, MimeHeaders};
 
-/// Returns a MIME part's contents as the exact bytes that were on the wire,
-/// undoing only the `Content-Transfer-Encoding` -- never the charset/text
-/// decoding that `MessagePart::contents()` applies to `text/*` parts.
+/// Returns a part's bytes with only the `Content-Transfer-Encoding` undone, never
+/// the charset decoding. CRLF becomes LF in non-base64 `text/*` parts.
 pub fn attachment_bytes(message: &Message<'_>, part: &MessagePart<'_>) -> Vec<u8> {
     let raw = &message.raw_message()[part.offset_body as usize..part.offset_end as usize];
-    match part.encoding {
-        Encoding::Base64 => base64_decode(raw).unwrap_or_default(),
+    let bytes = match part.encoding {
+        Encoding::Base64 => return base64_decode(raw).unwrap_or_default(),
         Encoding::QuotedPrintable => quoted_printable_decode(raw).unwrap_or_default(),
         Encoding::None => raw.to_vec(),
+    };
+    if is_text(part) {
+        crlf_to_lf(bytes)
+    } else {
+        bytes
     }
+}
+
+fn is_text(part: &MessagePart<'_>) -> bool {
+    part.content_type()
+        .is_none_or(|ct| ct.ctype().eq_ignore_ascii_case("text"))
+}
+
+fn crlf_to_lf(bytes: Vec<u8>) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    for (i, &b) in bytes.iter().enumerate() {
+        if b != b'\r' || bytes.get(i + 1) != Some(&b'\n') {
+            out.push(b);
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -105,14 +125,44 @@ mod tests {
     }
 
     #[test]
-    fn attachment_lf_line_endings_are_preserved() {
-        // The attachment uses bare LF; a naive quoted-printable encoder never
-        // touched them, so the wire bytes still contain LF, not CRLF.
-        let body: &[u8] = b"name,city\nHans,Wien\n";
+    fn text_qp_crlf_becomes_lf() {
+        let body: &[u8] = b"=EF=BB=BFname,city\r\nHans,Wi=\r\nen\r\nTotal,=C2=A391\r\n";
         let eml = build_eml("text/csv", "quoted-printable", body);
 
         let got = first_attachment_bytes(&eml);
-        assert_eq!(got, body.to_vec(), "LF line endings must not become CRLF");
+        assert_eq!(
+            got,
+            "\u{feff}name,city\nHans,Wien\nTotal,\u{a3}91\n".as_bytes()
+        );
+    }
+
+    #[test]
+    fn text_qp_bare_lf_is_untouched() {
+        let eml = build_eml("text/csv", "quoted-printable", b"a\nb\r\nc");
+
+        assert_eq!(first_attachment_bytes(&eml), b"a\nb\nc".to_vec());
+    }
+
+    #[test]
+    fn text_8bit_lone_cr_is_untouched() {
+        let eml = build_eml("text/csv", "8bit", b"a\rb\r\nc");
+
+        assert_eq!(first_attachment_bytes(&eml), b"a\rb\nc".to_vec());
+    }
+
+    #[test]
+    fn text_8bit_crlf_becomes_lf() {
+        let eml = build_eml("text/csv", "8bit", b"a,b\r\nc,d\r\n");
+
+        assert_eq!(first_attachment_bytes(&eml), b"a,b\nc,d\n".to_vec());
+    }
+
+    #[test]
+    fn text_base64_crlf_is_preserved() {
+        let body: &[u8] = b"a,b\r\nc,d\r\n";
+        let eml = build_eml("text/csv", "base64", base64_encode(body).as_bytes());
+
+        assert_eq!(first_attachment_bytes(&eml), body.to_vec());
     }
 
     #[test]
@@ -138,14 +188,18 @@ mod tests {
 
     #[test]
     fn attachment_binary_8bit_passthrough_is_unaffected() {
-        // Non-text Content-Type => PartType::Binary, not PartType::Text. Bytes
-        // include NUL, 0xFF, and both bare LF and CRLF, none of which should be
-        // touched: this is a control-group test, not a bug repro.
         let body: &[u8] = b"\x00\x01\xFEPDF\r\nsome\x00binary\nend\xFF";
         let eml = build_eml("application/octet-stream", "8bit", body);
 
         let got = first_attachment_bytes(&eml);
         assert_eq!(got, body.to_vec(), "binary attachments must be untouched");
+    }
+
+    #[test]
+    fn binary_qp_crlf_is_preserved() {
+        let eml = build_eml("application/octet-stream", "quoted-printable", b"a\r\nb");
+
+        assert_eq!(first_attachment_bytes(&eml), b"a\r\nb".to_vec());
     }
 
     #[test]
