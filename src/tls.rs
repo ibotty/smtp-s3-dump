@@ -4,8 +4,8 @@ use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
 use tokio_rustls::rustls::{
     crypto::CryptoProvider,
-    server::{ClientHello, ResolvesServerCert},
     pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer},
+    server::{ClientHello, ResolvesServerCert},
     sign::CertifiedKey,
 };
 use tracing::{instrument, trace};
