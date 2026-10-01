@@ -122,9 +122,22 @@ fn render(r: &Rejection) -> Vec<u8> {
     reply
 }
 
-async fn refuse<S: AsyncWrite + Unpin>(stream: &mut S, r: Rejection) -> io::Result<()> {
+async fn refuse<S: AsyncWrite + Unpin>(stream: &mut S, r: Rejection) -> Result<(), Error> {
     stream.write_all(&render(&r)).await?;
-    stream.shutdown().await
+    stream.shutdown().await?;
+    Err(Error::Closed(r))
+}
+
+/// Why [`serve`] ended abnormally. A client `QUIT`, a client that simply disconnects, and a
+/// requested [`Shutdown`] are not errors.
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error(transparent)]
+    Io(#[from] io::Error),
+    #[error("timed out waiting for the client")]
+    Timeout,
+    #[error("closed by the server: {0}")]
+    Closed(Rejection),
 }
 
 /// How a connection is (or is not) encrypted.
@@ -153,7 +166,7 @@ pub async fn serve<S, H>(
     cfg: Arc<Config>,
     tls: TlsMode,
     mut shutdown: Option<Shutdown>,
-) -> io::Result<()>
+) -> Result<(), Error>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
     H: Handler,
@@ -190,7 +203,7 @@ where
                 &mut shutdown,
             )
             .await?;
-            stream.shutdown().await
+            Ok(stream.shutdown().await?)
         }
         TlsMode::Implicit(acceptor) => {
             let mut stream = acceptor.accept(stream).await?;
@@ -199,7 +212,7 @@ where
                 Err(r) => return refuse(&mut stream, r).await,
             };
             run(&mut stream, session, handler, &cfg, &mut shutdown).await?;
-            stream.shutdown().await
+            Ok(stream.shutdown().await?)
         }
     }
 }
@@ -221,7 +234,7 @@ async fn run<S, T, H>(
     h: &mut H,
     cfg: &Config,
     shutdown: &mut Option<Shutdown>,
-) -> io::Result<Option<T::StartTls>>
+) -> Result<Option<T::StartTls>, Error>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
     T: Transport,
@@ -242,7 +255,7 @@ async fn run_inner<S, T, H>(
     cfg: &Config,
     shutdown: &mut Option<Shutdown>,
     message_open: &mut bool,
-) -> io::Result<Option<T::StartTls>>
+) -> Result<Option<T::StartTls>, Error>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
     T: Transport,
@@ -280,19 +293,19 @@ where
                     }
                     Some(Err(_elapsed)) => {
                         stream.write_all(&s.timed_out()).await?;
-                        return Ok(None);
+                        return Err(Error::Timeout);
                     }
                     Some(Ok(Ok(0))) => return Ok(None),
                     Some(Ok(Ok(n))) => {
                         s.feed(&buf[..n]);
                         s
                     }
-                    Some(Ok(Err(e))) => return Err(e),
+                    Some(Ok(Err(e))) => return Err(e.into()),
                 }
             }
-            Poll::Closed(out) => {
+            Poll::Closed(out, why) => {
                 stream.write_all(&out).await?;
-                return Ok(None);
+                return Err(Error::Closed(why));
             }
             Poll::Event(ev) => match ev {
                 crate::Event::Ehlo(req) => {
@@ -343,7 +356,7 @@ where
                     message.clear();
                     if let Err(r) = catch_panic(h.data_abort()).await {
                         stream.write_all(&render(&r)).await?;
-                        return Ok(None);
+                        return Err(Error::Closed(r));
                     }
                     n.resume()
                 }
@@ -352,7 +365,7 @@ where
                     message.clear();
                     if let Err(r) = catch_panic(h.rset()).await {
                         stream.write_all(&render(&r)).await?;
-                        return Ok(None);
+                        return Err(Error::Closed(r));
                     }
                     n.resume()
                 }

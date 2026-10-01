@@ -64,6 +64,12 @@ impl fmt::Display for EnhancedCode {
     }
 }
 
+impl fmt::Display for Rejection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} {} {}", self.code.get(), self.enhanced, self.text)
+    }
+}
+
 /// Error returned by [`Rejection::new`], [`RejectCode::new`] and [`EnhancedCode::new`]:
 /// only 4xx/5xx codes with a matching enhanced-code class are valid rejections.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

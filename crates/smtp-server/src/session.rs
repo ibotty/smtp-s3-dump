@@ -67,7 +67,7 @@ enum Phase {
         reply: Rejection,
     },
     /// A `421` reply was queued; the next [`Session::poll`] closes the connection.
-    Closing,
+    Closing(Rejection),
 }
 
 mod sealed {
@@ -151,8 +151,8 @@ pub enum Poll<T: Transport> {
     /// A decision is required; see the token inside for details.
     Event(Event<T>),
     /// The session decided to close on its own (e.g. too many bad commands).
-    /// Write the bytes and stop.
-    Closed(Vec<u8>),
+    /// Write the bytes and stop; the [`Rejection`] is the `421` that was sent.
+    Closed(Vec<u8>, Rejection),
 }
 
 /// Something a [`crate::Handler`] must react to.
@@ -275,7 +275,7 @@ impl<T: Transport> Session<T> {
     fn reply_and_continue(&mut self, r: &Rejection, otherwise: Phase) {
         self.push_reply(r);
         self.phase = if r.closes_session() {
-            Phase::Closing
+            Phase::Closing(r.clone())
         } else {
             otherwise
         };
@@ -338,7 +338,7 @@ impl<T: Transport> Session<T> {
     /// Advances the state machine as far as possible with the bytes fed so far.
     pub fn poll(mut self) -> Poll<T> {
         match std::mem::replace(&mut self.phase, Phase::Fresh) {
-            Phase::Closing => Poll::Closed(self.take_output()),
+            Phase::Closing(r) => Poll::Closed(self.take_output(), r),
             Phase::Receiving {
                 envelope,
                 receiver,
@@ -375,8 +375,9 @@ impl<T: Transport> Session<T> {
                     self.push_reply(&parse_error_reply(e));
                     self.bad_commands += 1;
                     if self.bad_commands >= self.cfg.max_bad_commands.get() {
-                        self.push_reply(&Rejection::too_many_bad_commands());
-                        return Poll::Closed(self.take_output());
+                        let r = Rejection::too_many_bad_commands();
+                        self.push_reply(&r);
+                        return Poll::Closed(self.take_output(), r);
                     }
                 }
             }
@@ -625,8 +626,9 @@ fn dispatch<T: Transport>(mut session: Session<T>, req: Request<String>) -> Disp
         }
         Request::Noop { .. } | Request::Vrfy { .. } | Request::Help { .. } => {
             if session.idle_commands >= session.cfg.max_idle_commands.get() {
-                session.push_reply(&Rejection::closing("too many commands"));
-                return Dispatch::Stop(Poll::Closed(session.take_output()));
+                let r = Rejection::closing("too many commands");
+                session.push_reply(&r);
+                return Dispatch::Stop(Poll::Closed(session.take_output(), r));
             }
             session.idle_commands += 1;
             let (code, esc, text) = match req {
@@ -1289,7 +1291,7 @@ mod tests {
         let mut s = Session::<Cleartext>::new(cfg);
         s.take_output();
         s.feed(b"NOTACOMMAND\r\nNOTACOMMAND\r\n");
-        let Poll::Closed(out) = s.poll() else {
+        let Poll::Closed(out, _) = s.poll() else {
             panic!("expected Closed")
         };
         assert!(out.starts_with(b"500"));
@@ -1376,7 +1378,7 @@ mod tests {
         };
         assert!(s.take_output().starts_with(b"250"));
         s.feed(b"VRFY x\r\n");
-        let Poll::Closed(out) = s.poll() else {
+        let Poll::Closed(out, _) = s.poll() else {
             panic!("expected Closed")
         };
         assert!(out.starts_with(b"421"));

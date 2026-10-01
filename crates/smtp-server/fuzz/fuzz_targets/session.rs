@@ -20,7 +20,7 @@ fn drive(mut session: Session<Plain>, data: &[u8]) -> Option<Session<Plain>> {
     for _ in 0..MAX_ITERATIONS {
         session = match session.poll() {
             Poll::NeedInput(s) => return Some(s),
-            Poll::Closed(_) => return None,
+            Poll::Closed(..) => return None,
             Poll::Event(Event::Ehlo(req)) => req.accept(),
             Poll::Event(Event::Helo(req)) => req.accept(),
             Poll::Event(Event::Mail(req)) => req.decide(Err(Rejection::transient("no"))),

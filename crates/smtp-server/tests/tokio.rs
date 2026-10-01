@@ -17,7 +17,7 @@ impl Handler for Echo {
     }
 }
 
-type Serve = tokio::task::JoinHandle<std::io::Result<()>>;
+type Serve = tokio::task::JoinHandle<Result<(), smtp_server::Error>>;
 
 fn cfg_with(f: impl FnOnce(&mut Config)) -> Arc<Config> {
     let mut c = Config::new(Hostname::new("mx.example.org").unwrap());
@@ -47,6 +47,12 @@ fn spawn(
 
 async fn join(task: Serve) {
     task.await.expect("task panicked").expect("serve failed");
+}
+
+async fn join_err(task: Serve) -> smtp_server::Error {
+    task.await
+        .expect("task panicked")
+        .expect_err("serve should have failed")
 }
 
 async fn read(client: &mut DuplexStream, buf: &mut [u8]) -> usize {
@@ -110,7 +116,7 @@ async fn command_timeout_closes_with_421() {
     let (mut client, task) = spawn(Echo, config, None);
     expect(&mut client, b"220").await;
     assert!(rest(&mut client).await.starts_with("421"));
-    join(task).await;
+    assert!(matches!(join_err(task).await, smtp_server::Error::Timeout));
 }
 
 #[tokio::test]
@@ -120,7 +126,7 @@ async fn data_deadline_closes_with_421() {
     envelope(&mut client).await;
     send(&mut client, b"DATA\r\n", b"354").await;
     assert!(rest(&mut client).await.starts_with("421"));
-    join(task).await;
+    assert!(matches!(join_err(task).await, smtp_server::Error::Timeout));
 }
 
 struct Panicky;
@@ -143,7 +149,10 @@ async fn panicking_handler_closes_with_421() {
     send(&mut client, b"MAIL FROM:<a@b>\r\n", b"250").await;
     client.write_all(b"RCPT TO:<c@d>\r\n").await.unwrap();
     assert!(rest(&mut client).await.starts_with("421"));
-    join(task).await;
+    assert!(matches!(
+        join_err(task).await,
+        smtp_server::Error::Closed(_)
+    ));
 }
 
 #[tokio::test]
@@ -222,7 +231,7 @@ async fn data_deadline_applies_while_discarding_oversize_message() {
     let all = rest(&mut client).await;
     assert!(closed, "deadline must close the session while discarding");
     assert!(all.contains("421"), "{all:?}");
-    join(task).await;
+    assert!(matches!(join_err(task).await, smtp_server::Error::Timeout));
 }
 
 struct Greeter(&'static str);
@@ -282,7 +291,10 @@ impl Handler for Boom {
 async fn panicking_greeting_closes_with_421() {
     let (mut client, task) = spawn(Boom { greeting: true }, cfg(), None);
     assert!(rest(&mut client).await.starts_with("421 "));
-    join(task).await;
+    assert!(matches!(
+        join_err(task).await,
+        smtp_server::Error::Closed(_)
+    ));
 }
 
 #[tokio::test]
@@ -291,7 +303,10 @@ async fn panicking_rset_closes_with_421() {
     expect(&mut client, b"220").await;
     client.write_all(b"RSET\r\n").await.unwrap();
     assert!(rest(&mut client).await.starts_with("421 "));
-    join(task).await;
+    assert!(matches!(
+        join_err(task).await,
+        smtp_server::Error::Closed(_)
+    ));
 }
 
 #[derive(Clone, Default)]
@@ -330,7 +345,7 @@ async fn streaming_session(
 }
 
 async fn finish(task: Serve, counts: &Counts) -> usize {
-    join(task).await;
+    let _ = task.await.expect("task panicked");
     counts.abort.load(Ordering::SeqCst)
 }
 

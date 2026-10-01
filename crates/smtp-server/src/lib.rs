@@ -27,7 +27,7 @@ pub use types::{
 };
 
 #[cfg(feature = "tokio")]
-pub use driver::{Handler, TlsMode, serve};
+pub use driver::{Error, Handler, TlsMode, serve};
 #[cfg(feature = "tokio")]
 pub use limit::{SessionGuard, SessionLimiter, reject_busy};
 #[cfg(feature = "tokio")]

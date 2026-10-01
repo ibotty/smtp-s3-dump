@@ -223,7 +223,7 @@ async fn start_smtp_server(
                         )
                         .await
                         {
-                            warn!("could not handle connection from {}: {}", addr, e);
+                            warn!(peer = %addr, error = %e, "connection ended abnormally");
                         }
                     });
                 }

@@ -2406,6 +2406,7 @@ dependencies = [
  "mail-parser",
  "proptest",
  "smtp-proto",
+ "thiserror",
  "tokio",
  "tokio-rustls",
  "tracing",
