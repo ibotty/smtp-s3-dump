@@ -96,11 +96,14 @@ async fn catch_panic<F: Future>(fut: F) -> Result<F::Output, Rejection> {
         .catch_unwind()
         .await
         .map_err(|payload| {
+            let msg = payload
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_owned())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "non-string panic payload".to_owned());
             #[cfg(feature = "tracing")]
-            tracing::error!(?payload, "SMTP handler panicked");
-            #[cfg(not(feature = "tracing"))]
-            let _ = payload;
-            Rejection::closing("internal error")
+            tracing::error!(panic = %msg, "SMTP handler panicked");
+            Rejection::closing("internal error").with_source(format!("handler panicked: {msg}"))
         })
 }
 
@@ -137,7 +140,7 @@ pub enum Error {
     #[error("timed out waiting for the client")]
     Timeout,
     #[error("closed by the server: {0}")]
-    Closed(Rejection),
+    Closed(#[source] Rejection),
 }
 
 /// How a connection is (or is not) encrypted.

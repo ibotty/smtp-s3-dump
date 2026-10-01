@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::error::Error;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
@@ -129,10 +130,10 @@ impl Handler for SmtpSession {
         if let Some(ev) = &mut self.event {
             match &result {
                 Ok(()) => ev.rcpts.push(rcpt),
-                Err((reason, _)) => ev.rejected.push(format!("{rcpt}:{reason}")),
+                Err(r) => ev.rejected.push(format!("{rcpt}:{}", cause(r))),
             }
         }
-        result.map_err(|(_, r)| r)
+        result
     }
 
     async fn data_end(&mut self, env: &Envelope, message: Vec<u8>) -> Result<String, Rejection> {
@@ -146,8 +147,8 @@ impl Handler for SmtpSession {
                 ev.emit("stored");
                 Ok(reply)
             }
-            Err((outcome, error, rejection)) => {
-                ev.error = Some(error);
+            Err((outcome, rejection)) => {
+                ev.error = Some(cause(&rejection));
                 ev.emit(outcome);
                 Err(rejection)
             }
@@ -177,6 +178,16 @@ fn validate(message: &Message<'_>) -> Result<(), &'static str> {
     Ok(())
 }
 
+fn cause(r: &Rejection) -> String {
+    let mut parts = Vec::new();
+    let mut e = r.source();
+    while let Some(x) = e {
+        parts.push(x.to_string());
+        e = x.source();
+    }
+    parts.join(": ")
+}
+
 fn denied(list: &Option<HashSet<String>>, addr: &str) -> bool {
     list.as_ref().is_some_and(|l| !l.contains(addr))
 }
@@ -189,12 +200,9 @@ impl SmtpSession {
         }
     }
 
-    async fn check_rcpt(&self, from: &str, rcpt: &str) -> Result<(), (String, Rejection)> {
+    async fn check_rcpt(&self, from: &str, rcpt: &str) -> Result<(), Rejection> {
         let unavailable = |reason: &str| {
-            (
-                reason.to_string(),
-                Rejection::mailbox_unavailable("mailbox unavailable"),
-            )
+            Rejection::mailbox_unavailable("mailbox unavailable").with_source(reason)
         };
 
         if denied(&self.config.allowed_rcpts, rcpt) {
@@ -210,10 +218,8 @@ impl SmtpSession {
                 Ok(true) => {}
                 Ok(false) => return Err(unavailable("db_denied")),
                 Err(e) => {
-                    return Err((
-                        format!("db_error: {e:#}"),
-                        Rejection::transient("could not handle request"),
-                    ))
+                    return Err(Rejection::transient("could not handle request")
+                        .with_source(e.context("db_error")))
                 }
             }
         }
@@ -225,12 +231,11 @@ impl SmtpSession {
         ev: &mut MailEvent,
         env: &Envelope,
         message: &[u8],
-    ) -> Result<String, (&'static str, String, Rejection)> {
+    ) -> Result<String, (&'static str, Rejection)> {
         let invalid = |e: &str| {
             (
                 "invalid",
-                e.to_string(),
-                Rejection::invalid_content(e.to_string()),
+                Rejection::invalid_content(e.to_string()).with_source(e.to_string()),
             )
         };
         let parsed = MessageParser::default()
@@ -246,8 +251,7 @@ impl SmtpSession {
                 .map_err(|e| {
                     (
                         "failed",
-                        format!("{e:#}"),
-                        Rejection::transient("could not handle request"),
+                        Rejection::transient("could not handle request").with_source(e),
                     )
                 })?;
             ev.stored += 1;
@@ -259,6 +263,14 @@ impl SmtpSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cause_joins_the_source_chain() {
+        let e = anyhow::anyhow!("connection refused").context("db_error");
+        let r = Rejection::transient("could not handle request").with_source(e);
+        assert_eq!(cause(&r), "db_error: connection refused");
+        assert_eq!(cause(&Rejection::transient("x")), "");
+    }
 
     fn check(eml: &str) -> Result<(), &'static str> {
         validate(&MessageParser::default().parse(eml.as_bytes()).unwrap())

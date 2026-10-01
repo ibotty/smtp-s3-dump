@@ -1,6 +1,7 @@
 //! Negative replies (4xx/5xx). Positive replies are built by the core only.
 
 use std::fmt;
+use std::sync::Arc;
 
 /// Replaces every control character (notably CR/LF) with a space, so reply text can
 /// never terminate its line early or inject further replies.
@@ -84,11 +85,21 @@ impl std::error::Error for InvalidRejection {}
 
 /// A negative (4xx/5xx) reply a [`crate::Handler`] can return to fail a step of the
 /// transaction. A 421 additionally closes the connection after it is sent.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// It can carry an internal cause ([`Rejection::with_source`]) that is never sent to the client;
+/// it is only exposed through [`std::error::Error::source`] for logging.
+#[derive(Debug, Clone)]
 pub struct Rejection {
     code: RejectCode,
     enhanced: EnhancedCode,
     text: String,
+    source: Option<Arc<dyn std::error::Error + Send + Sync>>,
+}
+
+impl std::error::Error for Rejection {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source.as_deref().map(|e| e as _)
+    }
 }
 
 impl Rejection {
@@ -106,7 +117,15 @@ impl Rejection {
             code,
             enhanced,
             text: sanitize_text(&text.into()),
+            source: None,
         })
+    }
+
+    /// Attaches the internal cause. It is not part of the reply sent to the client.
+    #[must_use]
+    pub fn with_source(mut self, e: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> Self {
+        self.source = Some(Arc::from(e.into()));
+        self
     }
 
     pub fn code(&self) -> RejectCode {
@@ -135,6 +154,7 @@ impl Rejection {
                 detail,
             },
             text: sanitize_text(&text.into()),
+            source: None,
         }
     }
 
@@ -241,6 +261,19 @@ impl Rejection {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_is_exposed_but_never_written() {
+        use std::error::Error;
+        let plain = Rejection::transient("try later");
+        let with = Rejection::transient("try later").with_source("db down");
+        assert!(plain.source().is_none());
+        assert_eq!(with.source().unwrap().to_string(), "db down");
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        plain.write(&mut a);
+        with.write(&mut b);
+        assert_eq!(a, b);
+    }
 
     #[test]
     fn new_rejects_2xx_3xx() {
