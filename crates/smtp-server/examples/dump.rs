@@ -2,11 +2,14 @@
 //! write one copy of each message per recipient. Run with `cargo run --example dump`.
 
 use std::io;
+use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use mail_parser::{MessageParser, MimeHeaders};
 use smtp_server::{
-    Config, Domain, Envelope, ForwardPath, Handler, Hostname, Recipient, Rejection, Sender, TlsMode,
+    Config, Domain, Envelope, ForwardPath, Handler, Hostname, Recipient, Rejection, Sender,
+    TlsMode, read_proxy_peer,
 };
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
@@ -15,9 +18,12 @@ use tokio_rustls::rustls::ServerConfig;
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 
 const MAX_CONNECTIONS: usize = 64;
+const PROXY_HEADER_TIMEOUT: Duration = Duration::from_secs(2);
 
 struct Dump {
     domain: Domain,
+    /// The client: the TCP peer, or the PROXY header's source on the PROXY port.
+    peer: SocketAddr,
 }
 
 impl Handler for Dump {
@@ -58,6 +64,7 @@ impl Handler for Dump {
             let stored: io::Result<()> = async {
                 tokio::fs::create_dir_all(&base).await?;
                 tokio::fs::write(format!("{base}/headers.txt"), &headers).await?;
+                tokio::fs::write(format!("{base}/peer.txt"), self.peer.to_string()).await?;
                 if let Some(body) = &text_body {
                     tokio::fs::write(format!("{base}/body.txt"), body).await?;
                 }
@@ -91,11 +98,21 @@ async fn main() -> io::Result<()> {
     let acceptor = TlsAcceptor::from(Arc::new(load_tls_config()?));
     // Buffered mode holds up to max_message_size per connection: bound concurrency.
     let slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
-    // 2525: plaintext with STARTTLS on offer; 4650: implicit TLS (SMTPS-style).
+    // 2525: plaintext with STARTTLS on offer; 4650: implicit TLS (SMTPS-style); 2526: like 2525
+    // but behind a (loopback-only) PROXY protocol v1/v2 proxy.
     tokio::try_join!(
         listen(
             "[::]:2525",
             TlsMode::StartTls(acceptor.clone()),
+            false,
+            &cfg,
+            &hostname,
+            &slots
+        ),
+        listen(
+            "[::]:2526",
+            TlsMode::StartTls(acceptor.clone()),
+            true,
             &cfg,
             &hostname,
             &slots
@@ -103,6 +120,7 @@ async fn main() -> io::Result<()> {
         listen(
             "[::]:4650",
             TlsMode::Implicit(acceptor),
+            false,
             &cfg,
             &hostname,
             &slots
@@ -114,6 +132,7 @@ async fn main() -> io::Result<()> {
 async fn listen(
     addr: &str,
     tls: TlsMode,
+    proxied: bool,
     cfg: &Arc<Config>,
     hostname: &Hostname,
     slots: &Arc<Semaphore>,
@@ -127,10 +146,25 @@ async fn listen(
             .expect("semaphore never closed");
         let (socket, peer) = listener.accept().await?;
         let (cfg, tls) = (cfg.clone(), tls.clone());
-        let mut handler = Dump {
-            domain: Domain::Name(hostname.clone()),
-        };
+        let domain = Domain::Name(hostname.clone());
         tokio::spawn(async move {
+            let mut socket = socket;
+            let mut peer = peer;
+            if proxied {
+                // Only loopback may speak PROXY; whoever can is believed about the client address.
+                if !peer.ip().to_canonical().is_loopback() {
+                    eprintln!("{peer}: not a trusted proxy");
+                    return;
+                }
+                match read_proxy_peer(&mut socket, peer, PROXY_HEADER_TIMEOUT).await {
+                    Ok(client) => peer = client,
+                    Err(e) => {
+                        eprintln!("{peer}: {e}");
+                        return;
+                    }
+                }
+            }
+            let mut handler = Dump { domain, peer };
             if let Err(e) = smtp_server::serve(socket, &mut handler, cfg, tls, None).await {
                 eprintln!("{peer}: {e}");
             }

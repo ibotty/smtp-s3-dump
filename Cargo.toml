@@ -19,12 +19,13 @@ arc-swap = "1.6.0"
 aws-config = { version = "1", features = ["behavior-version-latest"] }
 aws-sdk-s3 = { version = "1", default-features = false, features = ["default-https-client", "http-1x", "rt-tokio", "sigv4a"] }
 futures = "0.3.28"
+ipnet = "2"
 mail-parser = "0.11"
 mime_guess = "2"
 notify = { version = "8", default-features = false }
 notify-debouncer-mini = { version = "0.7", default-features = false }
 serde_json = "1.0.107"
-smtp-server = { path = "crates/smtp-server" }
+smtp-server = { path = "crates/smtp-server", features = ["proxy"] }
 sqlx = { version = "0.9", features = ["runtime-tokio", "tls-rustls", "postgres"] }
 thiserror = "2"
 tokio = { version = "1", features = ["tracing", "macros", "rt-multi-thread", "signal", "time"] }

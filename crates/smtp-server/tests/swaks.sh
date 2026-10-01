@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Integration test for examples/dump.rs, driven over a real TCP socket with `swaks`
 # (https://www.jetmore.org/john/code/swaks/): STARTTLS, implicit TLS, mail-parser part explosion, exact
-# byte-for-byte roundtrip of csv/binary attachments, and recipient rejection. Run directly
+# byte-for-byte roundtrip of csv/binary attachments, recipient rejection, and PROXY protocol v1/v2
+# (swaks' --proxy-*) on the PROXY listener. Run directly
 # (`bash tests/swaks.sh`, from anywhere) or via `cargo test --test swaks`, which execs this
 # script and skips it if `swaks` isn't installed.
 set -euo pipefail
@@ -10,13 +11,14 @@ cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 host=127.0.0.1
 port=2525
 tls_port=4650
+proxy_port=2526
 server_pid=
 tmp=
 
 cleanup() {
     [[ -n "$server_pid" ]] && kill "$server_pid" 2>/dev/null
     [[ -n "$tmp" ]] && rm -rf "$tmp"
-    rm -rf "alice@mx.example.org" "bob@mx.example.org" "carol@mx.example.org" "dave@mx.example.org"
+    rm -rf ./*@mx.example.org
 }
 trap cleanup EXIT
 
@@ -51,8 +53,8 @@ bin=$(cargo build --quiet --example dump --all-features --message-format=json |
 "$bin" >"$tmp/server.log" 2>&1 &
 server_pid=$!
 
-# Only probes the port: the implicit-TLS listener just sees a connect + close (failed handshake).
-for p in "$port" "$tls_port"; do
+# Only probes the port: the implicit-TLS and PROXY listeners just see a connect + close.
+for p in "$port" "$tls_port" "$proxy_port"; do
     for _ in $(seq 1 50); do
         { exec 3<>"/dev/tcp/$host/$p"; } 2>/dev/null && { exec 3>&-; break; }
         sleep 0.1
@@ -114,7 +116,61 @@ reject_foreign_recipient() {
     [[ ! -e elsewhere.example ]] || { echo "server stored mail for a rejected recipient"; return 1; }
 }
 
-tests=(delivery_with_attachment starttls_delivery implicit_tls_delivery attachment_roundtrip reject_foreign_recipient)
+# The client address the server recorded for the (single) message stored for <recipient>.
+peer_of() {
+    cat "$1/$(ls "$1")/peer.txt"
+}
+
+proxy_v1_delivery() {
+    swaks_to "$proxy_port" proxy1@mx.example.org \
+        --proxy-version 1 --proxy-family TCP4 --proxy-source 203.0.113.9 --proxy-source-port 5555 \
+        --proxy-dest 198.51.100.1 --proxy-dest-port 25 \
+        --header "Subject: via proxy v1" --body "hello through a proxy"
+    [[ $(peer_of proxy1@mx.example.org) == "203.0.113.9:5555" ]] || { echo "wrong peer: $(peer_of proxy1@mx.example.org)"; return 1; }
+}
+
+proxy_v2_starttls_delivery() {
+    swaks_to "$proxy_port" proxy2@mx.example.org -tls \
+        --proxy-version 2 --proxy-family AF_INET6 --proxy-source 2001:db8::9 --proxy-source-port 5555 \
+        --proxy-dest 2001:db8::1 --proxy-dest-port 25 \
+        --header "Subject: via proxy v2" --body "hello through a proxy, encrypted"
+    [[ $(peer_of proxy2@mx.example.org) == "[2001:db8::9]:5555" ]] || { echo "wrong peer: $(peer_of proxy2@mx.example.org)"; return 1; }
+}
+
+# swaks' own v2 LOCAL is truncated, so send the raw bytes after the signature: 0x20 = v2 LOCAL,
+# 0x00 = AF_UNSPEC, 0x0000 = no payload.
+proxy_v2_local_keeps_tcp_peer() {
+    printf '\x20\x00\x00\x00' >"$tmp/local.bin"
+    swaks_to "$proxy_port" proxy3@mx.example.org \
+        --proxy-version 2 --proxy "@$tmp/local.bin" \
+        --header "Subject: via proxy v2 local" --body "health check style"
+    [[ $(peer_of proxy3@mx.example.org) =~ ^127\.0\.0\.1:[0-9]+$ ]] || { echo "wrong peer: $(peer_of proxy3@mx.example.org)"; return 1; }
+}
+
+proxy_port_requires_header() {
+    if swaks_to "$proxy_port" proxy4@mx.example.org --timeout 10 --header "Subject: no header" --body "nope" >/dev/null 2>&1; then
+        echo "expected swaks to fail: the PROXY listener needs a PROXY header"
+        return 1
+    fi
+    [[ ! -e proxy4@mx.example.org ]] || { echo "server stored mail without a PROXY header"; return 1; }
+}
+
+# The plain listener must never believe a PROXY header (it would be spoofable): either it refuses
+# the session or the recorded peer is the real one.
+plain_port_ignores_proxy_header() {
+    swaks_to "$port" spoof@mx.example.org --timeout 10 \
+        --proxy-version 1 --proxy-family TCP4 --proxy-source 203.0.113.66 --proxy-source-port 5555 \
+        --proxy-dest 198.51.100.1 --proxy-dest-port 25 \
+        --header "Subject: spoof" --body "nope" >/dev/null 2>&1 || true
+    if [[ -d spoof@mx.example.org ]] && [[ $(peer_of spoof@mx.example.org) == 203.0.113.66:* ]]; then
+        echo "plain listener believed a PROXY header"
+        return 1
+    fi
+}
+
+tests=(delivery_with_attachment starttls_delivery implicit_tls_delivery attachment_roundtrip reject_foreign_recipient
+    proxy_v1_delivery proxy_v2_starttls_delivery proxy_v2_local_keeps_tcp_peer proxy_port_requires_header
+    plain_port_ignores_proxy_header)
 printf '\nrunning %d tests\n' "${#tests[@]}"
 for t in "${tests[@]}"; do run_test "$t"; done
 

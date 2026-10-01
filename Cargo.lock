@@ -1190,6 +1190,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "haproxy-protocol"
+version = "0.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "758f6e6f705a5bd9ff33046c686b474909cb903e0c28042f4de630dfe1571867"
+dependencies = [
+ "hex",
+ "nom",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "hashbrown"
 version = "0.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1683,6 +1695,15 @@ dependencies = [
  "log",
  "wasi",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "nom"
+version = "8.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "df9761775871bdef83bee530e60050f7e54b1105350d6884eb0fb4f46c2f9405"
+dependencies = [
+ "memchr",
 ]
 
 [[package]]
@@ -2384,6 +2405,7 @@ dependencies = [
  "aws-config",
  "aws-sdk-s3",
  "futures",
+ "ipnet",
  "mail-parser",
  "mime_guess",
  "notify",
@@ -2403,6 +2425,7 @@ name = "smtp-server"
 version = "0.1.0"
 dependencies = [
  "futures-util",
+ "haproxy-protocol",
  "mail-parser",
  "proptest",
  "smtp-proto",

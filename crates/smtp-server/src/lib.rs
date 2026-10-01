@@ -11,6 +11,8 @@ mod types;
 mod driver;
 #[cfg(feature = "tokio")]
 mod limit;
+#[cfg(feature = "proxy")]
+mod proxy;
 #[cfg(feature = "tokio")]
 mod shutdown;
 
@@ -30,6 +32,8 @@ pub use types::{
 pub use driver::{Error, Handler, TlsMode, serve};
 #[cfg(feature = "tokio")]
 pub use limit::{SessionGuard, SessionLimiter, reject_busy};
+#[cfg(feature = "proxy")]
+pub use proxy::{ProxyError, ProxyHeader, read_proxy_header, read_proxy_peer};
 #[cfg(feature = "tokio")]
 pub use shutdown::{Shutdown, ShutdownTrigger, shutdown_signal};
 

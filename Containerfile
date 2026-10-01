@@ -10,7 +10,7 @@ LABEL maintainer="Tobias Florek <tob@butter.sh>" \
       org.opencontainers.image.source="https://github.com/ibotty/smtp-s3-dump" \
       org.opencontainers.image.authors="Tobias Florek <tob@butter.sh>"
 
-EXPOSE 2525/tcp
+EXPOSE 2525/tcp 2526/tcp
 
 COPY $BINARY /smtp-s3-dump
 

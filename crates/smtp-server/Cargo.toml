@@ -11,6 +11,7 @@ tokio-rustls = { version = "0.26", optional = true }
 futures-util = { version = "0.3", default-features = false, features = ["std"], optional = true }
 tracing = { version = "0.1", optional = true }
 thiserror = { version = "2", optional = true }
+haproxy-protocol = { version = "0.0.4", features = ["tokio"], optional = true }
 
 [dev-dependencies]
 mail-parser = "0.11"
@@ -21,6 +22,11 @@ tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "fs", "s
 default = ["tokio", "tracing"]
 tokio = ["dep:tokio", "dep:tokio-rustls", "dep:futures-util", "dep:thiserror"]
 tracing = ["dep:tracing"]
+proxy = ["tokio", "dep:haproxy-protocol"]
+
+[[example]]
+name = "dump"
+required-features = ["proxy"]
 
 [package.metadata.release]
 release = false
