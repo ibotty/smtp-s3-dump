@@ -3,4 +3,5 @@ publish = false
 sign-commit = true
 sign-tag = true
 tag-name = "v{{version}}"
-pre-release-commit-message = "bump version"
+pre-release-commit-message = "chore(release): {{version}}"
+shared-version = true
