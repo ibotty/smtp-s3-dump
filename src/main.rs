@@ -33,6 +33,7 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(25);
 
 const DEFAULT_MAX_SESSIONS: usize = 100;
 const DEFAULT_MAX_SESSIONS_PER_IP: usize = 10;
+const MAX_MESSAGE_SIZE: usize = 100_000_000;
 
 /// Parse a positive integer limit; unset falls back to `default`, invalid/zero is an error.
 fn parse_limit(name: &str, value: Option<String>, default: usize) -> Result<usize> {
@@ -69,18 +70,17 @@ async fn main() -> Result<()> {
         .expect("failed to install default rustls crypto provider");
 
     let smtp_bind_addr = env::var("SMTP_BIND_ADDR").unwrap_or("0.0.0.0:2525".to_string());
-    let limiter = SessionLimiter::new(
-        parse_limit(
-            "MAX_SESSIONS",
-            env::var("MAX_SESSIONS").ok(),
-            DEFAULT_MAX_SESSIONS,
-        )?,
-        Some(parse_limit(
-            "MAX_SESSIONS_PER_IP",
-            env::var("MAX_SESSIONS_PER_IP").ok(),
-            DEFAULT_MAX_SESSIONS_PER_IP,
-        )?),
-    );
+    let max_sessions = parse_limit(
+        "MAX_SESSIONS",
+        env::var("MAX_SESSIONS").ok(),
+        DEFAULT_MAX_SESSIONS,
+    )?;
+    let max_sessions_per_ip = parse_limit(
+        "MAX_SESSIONS_PER_IP",
+        env::var("MAX_SESSIONS_PER_IP").ok(),
+        DEFAULT_MAX_SESSIONS_PER_IP,
+    )?;
+    let limiter = SessionLimiter::new(max_sessions, Some(max_sessions_per_ip));
     let smtp_domain = required("SMTP_DOMAIN")?;
     let bucket = required("BUCKET_NAME")?;
     let cert_path = required("SMTP_CERT_FILE")?;
@@ -120,7 +120,23 @@ async fn main() -> Result<()> {
     let domain =
         Hostname::new(&smtp_domain).map_err(|e| anyhow!("could not parse SMTP_DOMAIN: {}", e))?;
     let mut server = smtp_server::Config::new(domain);
-    server.max_message_size = MessageSize::new(100_000_000);
+    server.max_message_size = MessageSize::new(MAX_MESSAGE_SIZE);
+    info!(
+        smtp_domain,
+        bind_addr = smtp_bind_addr,
+        cert_file = cert_path,
+        key_file = key_path,
+        bucket,
+        s3_endpoint = aws_config.endpoint_url(),
+        s3_region = aws_config.region().map(|r| r.as_ref()),
+        check_db,
+        allowed_rcpts = allowed_rcpts.as_ref().map(HashSet::len),
+        allowed_froms = allowed_froms.as_ref().map(HashSet::len),
+        max_sessions,
+        max_sessions_per_ip,
+        max_message_size = MAX_MESSAGE_SIZE,
+        "configuration"
+    );
     let config = Arc::new(Config {
         s3: aws_sdk_s3::Client::from_conf(s3_config),
         pg_pool,
@@ -149,10 +165,7 @@ async fn main() -> Result<()> {
         // the server only ends on its own if it failed (e.g. bind error)
         res = &mut server => return res.context("smtp server task failed")?,
     }
-    info!(
-        "shutting down, waiting up to {:?} for open sessions",
-        SHUTDOWN_GRACE
-    );
+    info!(grace = ?SHUTDOWN_GRACE, "shutting down, waiting for open sessions");
 
     trigger.trigger();
     tokio::select! {
@@ -181,10 +194,10 @@ async fn start_smtp_server(
     limiter: Arc<SessionLimiter<IpAddr>>,
     stop: Shutdown,
 ) -> Result<()> {
-    info!("listening on {}", smtp_bind_addr);
     let listener = TcpListener::bind(&smtp_bind_addr)
         .await
         .with_context(|| format!("cannot listen on {smtp_bind_addr}"))?;
+    info!(addr = smtp_bind_addr, "listening");
 
     let mut stopped = stop.clone();
     let mut sessions = JoinSet::new();
@@ -194,16 +207,16 @@ async fn start_smtp_server(
             // reap finished sessions so the set does not grow
             Some(res) = sessions.join_next() => {
                 if let Err(e) = res {
-                    error!("session task failed: {}", e);
+                    error!(error = %e, "session task failed");
                 }
             }
             accepted = listener.accept() => match accepted {
                 Ok((socket, addr)) => {
                     let Some(guard) = limiter.try_acquire(addr.ip()) else {
-                        warn!("session limit reached, refusing connection from {}", addr);
+                        warn!(peer = %addr, "session limit reached, refusing connection");
                         sessions.spawn(async move {
                             if let Err(e) = reject_busy(socket).await {
-                                warn!("could not send busy reply to {}: {}", addr, e);
+                                warn!(peer = %addr, error = %e, "could not send busy reply");
                             }
                         });
                         continue;
@@ -229,7 +242,7 @@ async fn start_smtp_server(
                 }
                 Err(e) => {
                     // e.g. out of file descriptors: keep serving, don't spin
-                    error!("accept failed: {}", e);
+                    error!(error = %e, "accept failed");
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
             }
@@ -237,7 +250,7 @@ async fn start_smtp_server(
     }
 
     drop(listener);
-    info!("waiting for {} open session(s)", sessions.len());
+    info!(open_sessions = sessions.len(), "waiting for open sessions");
     while sessions.join_next().await.is_some() {}
     Ok(())
 }
