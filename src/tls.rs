@@ -1,10 +1,11 @@
-use std::{fs::File, io::BufReader, sync::Arc};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
 use tokio_rustls::rustls::{
     crypto::CryptoProvider,
     server::{ClientHello, ResolvesServerCert},
+    pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer},
     sign::CertifiedKey,
 };
 use tracing::{instrument, trace};
@@ -24,10 +25,8 @@ impl CertificateResolver {
         let crypto_provider =
             CryptoProvider::get_default().context("no default crypto provider")?;
 
-        let certs: Vec<_> = rustls_pemfile::certs(&mut BufReader::new(File::open(cert_path)?))
-            .collect::<Result<_, _>>()?;
-        let key = rustls_pemfile::private_key(&mut BufReader::new(File::open(key_path)?))?
-            .context("no private key found")?;
+        let certs = CertificateDer::pem_file_iter(cert_path)?.collect::<Result<Vec<_>, _>>()?;
+        let key = PrivateKeyDer::from_pem_file(key_path).context("no private key found")?;
         let key = crypto_provider
             .key_provider
             .load_private_key(key)

@@ -1,7 +1,7 @@
 //! What `smtp-s3-dump` would look like built on `smtp-server`: accept mail for one domain,
 //! write one copy of each message per recipient. Run with `cargo run --example dump`.
 
-use std::io::{self, BufReader};
+use std::io;
 use std::sync::Arc;
 
 use mail_parser::{MessageParser, MimeHeaders};
@@ -11,6 +11,7 @@ use smtp_server::{
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tokio_rustls::TlsAcceptor;
+use tokio_rustls::rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
 use tokio_rustls::rustls::ServerConfig;
 
 const MAX_CONNECTIONS: usize = 64;
@@ -143,15 +144,12 @@ async fn listen(
 /// `openssl req -x509 -newkey rsa:2048 -days 3650 -nodes -subj "/CN=mx.example.org" \
 ///   -keyout examples/tls.key -out examples/tls.crt`
 fn load_tls_config() -> io::Result<ServerConfig> {
-    let mut cert_file = BufReader::new(std::fs::File::open("examples/tls.crt")?);
-    let certs = rustls_pemfile::certs(&mut cert_file).collect::<Result<Vec<_>, _>>()?;
-    let mut key_file = BufReader::new(std::fs::File::open("examples/tls.key")?);
-    let key = rustls_pemfile::private_key(&mut key_file)?.ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "no private key in examples/tls.key",
-        )
-    })?;
+    let to_io = |e| io::Error::new(io::ErrorKind::InvalidData, e);
+    let certs = CertificateDer::pem_file_iter("examples/tls.crt")
+        .map_err(to_io)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(to_io)?;
+    let key = PrivateKeyDer::from_pem_file("examples/tls.key").map_err(to_io)?;
     ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs, key)
