@@ -124,8 +124,8 @@ async fn main() -> Result<()> {
     info!(
         smtp_domain,
         bind_addr = smtp_bind_addr,
-        cert_file = cert_path,
-        key_file = key_path,
+        cert_path,
+        key_path,
         bucket,
         s3_endpoint = aws_config.endpoint_url(),
         s3_region = aws_config.region().map(|r| r.as_ref()),
@@ -165,7 +165,10 @@ async fn main() -> Result<()> {
         // the server only ends on its own if it failed (e.g. bind error)
         res = &mut server => return res.context("smtp server task failed")?,
     }
-    info!(grace = ?SHUTDOWN_GRACE, "shutting down, waiting for open sessions");
+    info!(
+        grace_secs = SHUTDOWN_GRACE.as_secs(),
+        "shutting down, waiting for open sessions"
+    );
 
     trigger.trigger();
     tokio::select! {
@@ -197,7 +200,7 @@ async fn start_smtp_server(
     let listener = TcpListener::bind(&smtp_bind_addr)
         .await
         .with_context(|| format!("cannot listen on {smtp_bind_addr}"))?;
-    info!(addr = smtp_bind_addr, "listening");
+    info!(bind_addr = smtp_bind_addr, "listening");
 
     let mut stopped = stop.clone();
     let mut sessions = JoinSet::new();

@@ -14,7 +14,7 @@ pub async fn watch_certs(resolver: Arc<tls::CertificateResolver>) -> Result<()> 
     let (tx, mut rx) = tokio::sync::mpsc::channel(1);
     let mut debouncer = new_debouncer(Duration::from_secs(2), move |res: DebounceEventResult| {
         if let Err(e) = tx.try_send(res) {
-            error!(error = ?e, "could not send event");
+            error!(error = %e, "could not send event");
         }
     })?;
 
@@ -38,11 +38,11 @@ pub async fn watch_certs(resolver: Arc<tls::CertificateResolver>) -> Result<()> 
                 Ok(event) => {
                     trace!(event = ?event, "got inotify event");
                     if let Err(e) = resolver.refresh() {
-                        error!(error = ?e, "could not refresh certificates");
+                        error!(error = %format_args!("{e:#}"), "could not refresh certificates");
                     }
                 }
                 Err(e) => {
-                    error!(error = ?e, "inotify error");
+                    error!(error = %e, "inotify error");
                 }
             }
         }

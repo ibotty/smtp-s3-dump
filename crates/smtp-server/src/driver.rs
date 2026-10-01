@@ -109,7 +109,7 @@ async fn catch_panic<F: Future>(fut: F) -> Result<F::Output, Rejection> {
                 .or_else(|| payload.downcast_ref::<String>().cloned())
                 .unwrap_or_else(|| "non-string panic payload".to_owned());
             #[cfg(feature = "tracing")]
-            tracing::error!(panic = %msg, "SMTP handler panicked");
+            tracing::error!(error = %msg, "SMTP handler panicked");
             Rejection::closing("internal error").with_source(format!("handler panicked: {msg}"))
         })
 }
