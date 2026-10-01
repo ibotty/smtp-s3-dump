@@ -384,7 +384,7 @@ impl Sender {
         }
 
         let env_id = match from.env_id {
-            Some(raw) if cfg.dsn => Some(EnvId(xtext_decode(&raw)?)),
+            Some(raw) if cfg.dsn => Some(EnvId(raw)),
             Some(_) => return Err(Rejection::unsupported_param("ENVID")),
             None => None,
         };
@@ -484,7 +484,10 @@ impl Recipient {
         }
 
         let orcpt = match to.orcpt {
-            Some(raw) if cfg.dsn => Some(parse_orcpt(&raw)?),
+            Some(addr) if cfg.dsn => Some(OriginalRecipient {
+                addr_type: "rfc822".to_owned(),
+                addr,
+            }),
             Some(_) => return Err(Rejection::unsupported_param("ORCPT")),
             None => None,
         };
@@ -495,38 +498,6 @@ impl Recipient {
             orcpt,
         })
     }
-}
-
-fn parse_orcpt(raw: &str) -> Result<OriginalRecipient, Rejection> {
-    let (addr_type, addr) = raw
-        .split_once(';')
-        .ok_or_else(|| Rejection::unsupported_param("ORCPT"))?;
-    Ok(OriginalRecipient {
-        addr_type: addr_type.to_owned(),
-        addr: xtext_decode(addr)?,
-    })
-}
-
-/// RFC 3461 xtext decoding: `+HH` is a hex-escaped byte, everything else is literal.
-fn xtext_decode(s: &str) -> Result<String, Rejection> {
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'+' {
-            let hex = bytes
-                .get(i + 1..i + 3)
-                .and_then(|h| std::str::from_utf8(h).ok())
-                .and_then(|h| u8::from_str_radix(h, 16).ok())
-                .ok_or_else(|| Rejection::unsupported_param("xtext"))?;
-            out.push(hex);
-            i += 3;
-        } else {
-            out.push(bytes[i]);
-            i += 1;
-        }
-    }
-    String::from_utf8(out).map_err(|_| Rejection::unsupported_param("xtext"))
 }
 
 /// A non-empty, singly-growable list. `RCPT` guarantees at least one recipient.

@@ -1110,6 +1110,20 @@ mod tests {
     }
 
     #[test]
+    fn rcpt_with_orcpt_and_mail_with_envid_are_accepted_and_decoded_once() {
+        let Poll::Event(Event::DataStart(req)) = drive(
+            cfg(),
+            b"EHLO client\r\nMAIL FROM:<a@b> ENVID=x+2Bq\r\nRCPT TO:<c@d> ORCPT=rfc822;c@d NOTIFY=FAILURE\r\nDATA\r\n",
+        ) else {
+            panic!("expected DataStart event")
+        };
+        let env = req.envelope();
+        assert_eq!(env.sender().env_id().unwrap().as_str(), "x+q");
+        let orcpt = env.rcpts().first().orcpt().unwrap();
+        assert_eq!((orcpt.addr_type(), orcpt.addr()), ("rfc822", "c@d"));
+    }
+
+    #[test]
     fn rcpt_before_mail_is_bad_sequence() {
         let Poll::NeedInput(mut s) = drive(cfg(), b"EHLO client\r\nRCPT TO:<a@b>\r\n") else {
             panic!("expected NeedInput")
