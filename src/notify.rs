@@ -5,7 +5,7 @@ use std::time::Duration;
 use tokio::spawn;
 
 use notify_debouncer_mini::{new_debouncer, notify::RecursiveMode, DebounceEventResult};
-use tracing::{error, info, instrument, trace};
+use tracing::{error, instrument, trace};
 
 use crate::tls;
 
@@ -37,10 +37,9 @@ pub async fn watch_certs(resolver: Arc<tls::CertificateResolver>) -> Result<()> 
             match res {
                 Ok(event) => {
                     trace!("got inotify event {:?}", event);
-                    match resolver.refresh() {
-                        Ok(()) => info!("refreshed certificates successfully"),
-                        Err(e) => error!("could not refresh certificates: {:?}", e),
-                    };
+                    if let Err(e) = resolver.refresh() {
+                        error!("could not refresh certificates: {:?}", e);
+                    }
                 }
                 Err(e) => {
                     error!("inotify error: {:?}", e);
