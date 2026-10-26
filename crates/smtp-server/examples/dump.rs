@@ -6,7 +6,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use mail_parser::{MessageParser, MimeHeaders};
+use mail_parser::MessageParser;
 use smtp_server::{
     Config, Domain, Envelope, ForwardPath, Handler, Hostname, Recipient, Rejection, Sender,
     TlsMode, read_proxy_peer,
@@ -45,17 +45,24 @@ impl Handler for Dump {
             .parse(&msg)
             .ok_or_else(|| Rejection::transient("could not parse message"))?;
         let headers: String = message
-            .headers_raw()
-            .map(|(k, v)| format!("{k}:{v}"))
+            .headers()
+            .iter()
+            .map(|h| {
+                format!(
+                    "{}:{}",
+                    h.raw_name(),
+                    String::from_utf8_lossy(h.raw_value())
+                )
+            })
             .collect();
         let text_body = message.body_text(0).map(|b| b.into_owned());
         let html_body = message.body_html(0).map(|b| b.into_owned());
-        let attachments: Vec<(String, &[u8])> = message
+        let attachments: Vec<(String, _)> = message
             .attachments()
             .enumerate()
             .map(|(ix, part)| {
                 let name = part.attachment_name().unwrap_or("attachment");
-                (format!("{ix:02}-{name}"), part.contents())
+                (format!("{ix:02}-{name}"), part.decoded())
             })
             .collect();
 

@@ -1,6 +1,6 @@
 [package]
 name = "smtp-server"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 
@@ -14,7 +14,7 @@ thiserror = { version = "2", optional = true }
 haproxy-protocol = { version = "0.0.4", features = ["tokio"], optional = true }
 
 [dev-dependencies]
-mail-parser = "0.11"
+mail-parser = "1"
 proptest = "1.11.0"
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "fs", "sync", "io-util", "test-util"] }
 

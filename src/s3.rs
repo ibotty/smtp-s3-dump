@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use aws_sdk_s3::primitives::ByteStream;
 use futures::future::try_join_all;
-use mail_parser::{Message, MessagePart, MimeHeaders};
+use mail_parser::Message;
 use serde_json::{json, Map, Value};
 
 use crate::attachment;
@@ -50,13 +50,18 @@ fn plan_uploads(rcpt: &str, from: &str, message: &Message<'_>) -> Result<UploadP
             "content_type": content_type,
         }));
         uploads.push(Upload {
-            body: attachment::attachment_bytes(message, part),
+            body: attachment::attachment_bytes(part),
             key,
             content_type,
         });
     }
 
-    let headers = headers_to_json(message.headers_raw());
+    let raw_headers: Vec<_> = message
+        .headers()
+        .iter()
+        .map(|h| (h.raw_name(), String::from_utf8_lossy(h.raw_value())))
+        .collect();
+    let headers = headers_to_json(raw_headers.iter().map(|(k, v)| (*k, v.as_ref())));
     let mut push = |name: &str, body: Vec<u8>| {
         let key = format!("{base_path}{name}");
         uploads.push(Upload {
@@ -68,23 +73,19 @@ fn plan_uploads(rcpt: &str, from: &str, message: &Message<'_>) -> Result<UploadP
     push("headers.json", serde_json::to_vec_pretty(&headers)?);
 
     // this selects only the first part
-    let body_text = message.text_bodies().next();
-    if let Some(part) = body_text {
-        push("body.txt", part.contents().to_vec());
+    let body_text = message.text_body().next().and_then(|p| p.text());
+    if let Some(text) = &body_text {
+        push("body.txt", text.as_bytes().to_vec());
     }
 
     // this selects only the first part
-    let body_html = message.html_bodies().next();
-    if let Some(part) = body_html {
-        push("body.html", part.contents().to_vec());
+    let body_html = message.html_body().next().and_then(|p| p.text());
+    if let Some(html) = &body_html {
+        push("body.html", html.as_bytes().to_vec());
     }
 
-    let trimmed = |part: Option<&MessagePart<'_>>| {
-        part.and_then(MessagePart::text_contents)
-            .unwrap_or("")
-            .trim()
-            .to_string()
-    };
+    let trimmed =
+        |body: Option<std::borrow::Cow<'_, str>>| body.as_deref().unwrap_or("").trim().to_string();
     Ok(UploadPlan {
         message_id: message_id.to_string(),
         uploads,

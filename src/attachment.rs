@@ -2,7 +2,7 @@
 //! CRLF line breaks in text parts.
 //!
 //! `mail-parser` classifies any `Content-Type: text/*` MIME part as `PartType::Text`,
-//! decoding it into a UTF-8 `String` while parsing (see `mail_parser::parsers::message`).
+//! decoding it into a UTF-8 `String` while parsing (see `mail-parser` 0.11).
 //! That's correct for message bodies, but wrong for attachments such as CSV files:
 //!
 //! - quoted-printable decoding yields CRLF line breaks, even when the original
@@ -16,27 +16,20 @@
 //! `is_encoding_problem` does not flag any of this: it's only set for malformed
 //! message structure, never for a lossy charset fallback.
 
-use mail_parser::decoders::base64::base64_decode;
-use mail_parser::decoders::quoted_printable::quoted_printable_decode;
-use mail_parser::{Encoding, Message, MessagePart, MimeHeaders};
+use mail_parser::{Encoding, MessagePart};
 
 /// Returns a part's bytes with only the `Content-Transfer-Encoding` undone, never
 /// the charset decoding. CRLF becomes LF in non-base64 `text/*` parts.
-pub fn attachment_bytes(message: &Message<'_>, part: &MessagePart<'_>) -> Vec<u8> {
-    let raw = &message.raw_message()[part.offset_body as usize..part.offset_end as usize];
-    let bytes = match part.encoding {
-        Encoding::Base64 => return base64_decode(raw).unwrap_or_default(),
-        Encoding::QuotedPrintable => quoted_printable_decode(raw).unwrap_or_default(),
-        Encoding::None => raw.to_vec(),
-    };
-    if is_text(part) {
+pub fn attachment_bytes(part: MessagePart<'_>) -> Vec<u8> {
+    let bytes = part.decoded().into_owned();
+    if part.encoding() != Encoding::Base64 && is_text(part) {
         crlf_to_lf(bytes)
     } else {
         bytes
     }
 }
 
-fn is_text(part: &MessagePart<'_>) -> bool {
+fn is_text(part: MessagePart<'_>) -> bool {
     part.content_type()
         .is_none_or(|ct| ct.ctype().eq_ignore_ascii_case("text"))
 }
@@ -87,7 +80,7 @@ mod tests {
             .attachments()
             .next()
             .expect("fixture message must have an attachment");
-        super::attachment_bytes(&message, part)
+        super::attachment_bytes(part)
     }
 
     fn utf16le_with_bom(s: &str) -> Vec<u8> {
