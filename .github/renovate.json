@@ -3,16 +3,26 @@
   "extends": ["config:recommended", "helpers:pinGitHubActionDigestsToSemver", "security:openssf-scorecard", "docker:pinDigests"],
   "lockFileMaintenance": { "enabled": true, "automerge": true },
   "minimumReleaseAge": "7 days",
+  "internalChecksFilter": "strict",
   "packageRules": [
     {
       "matchManagers": ["github-actions"],
       "groupName": "github actions",
-      "separateMajorMinor": false
+      "automerge": true
     },
     {
       "matchManagers": ["cargo"],
       "groupName": "cargo dependencies",
-      "separateMajorMinor": false
+      "automerge": true
+    },
+    {
+      "matchUpdateTypes": ["major"],
+      "groupName": null,
+      "automerge": false
+    },
+    {
+      "matchUpdateTypes": ["lockFileMaintenance"],
+      "minimumReleaseAge": null
     }
   ]
 }
