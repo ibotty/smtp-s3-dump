@@ -14,7 +14,7 @@ build: ## Debug build
 	cargo build --workspace
 
 release-build: ## Release build
-	cargo build --workspace --release
+	cargo build --workspace --release --target x86_64-unknown-linux-musl
 
 test: ## Run tests
 	cargo test --workspace

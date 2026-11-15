@@ -1,5 +1,5 @@
 FROM registry.access.redhat.com/ubi10-minimal@sha256:a9f9316ec3a1419a2de6ce4d2d9f034d477e97cdf2a16d6f04b7bd632ac753c4
-ARG BINARY=target/release/smtp-s3-dump
+ARG BINARY=target/x86_64-unknown-linux-musl/release/smtp-s3-dump
 ARG VERSION
 
 LABEL maintainer="Tobias Florek <tob@butter.sh>" \

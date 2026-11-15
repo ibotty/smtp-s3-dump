@@ -3,6 +3,7 @@ name: Release
 env:
   REGISTRY: quay.io/ibotty
   IMAGE_NAME: smtp-s3-dump
+  CARGO_BUILD_TARGET: x86_64-unknown-linux-musl
 
 on:
   push:
@@ -79,13 +80,14 @@ jobs:
       with:
         persist-credentials: false
     - run: |
-        rustup toolchain install stable --profile minimal --no-self-update
+        rustup toolchain install stable --profile minimal -t x86_64-unknown-linux-musl --no-self-update
         rustup default stable
+    - run: sudo apt-get install -y musl-tools
     - run: cargo build --locked --release --all-features
     - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
       with:
         name: release-bin
-        path: target/release/smtp-s3-dump
+        path: target/x86_64-unknown-linux-musl/release/smtp-s3-dump
         retention-days: 1
 
   github-release:
@@ -142,10 +144,10 @@ jobs:
     - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
       with:
         name: release-bin
-        path: target/release
+        path: target/x86_64-unknown-linux-musl/release
 
     # upload-artifact drops the executable bit; restore it before COPY.
-    - run: chmod +x target/release/smtp-s3-dump
+    - run: chmod +x target/x86_64-unknown-linux-musl/release/smtp-s3-dump
 
     - name: Log into registry
       uses: redhat-actions/podman-login@4c93cb1ea36b10156ea541570dc69bc04dffe10e # v1.1.2
