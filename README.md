@@ -1,5 +1,10 @@
 # SMTP microservice to get mail and store in S3
 
+[![CI](https://github.com/ibotty/smtp-s3-dump/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/ibotty/smtp-s3-dump/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/ibotty/smtp-s3-dump)](https://github.com/ibotty/smtp-s3-dump/releases/latest)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/ibotty/smtp-s3-dump/badge)](https://scorecard.dev/viewer/?uri=github.com/ibotty/smtp-s3-dump)
+[![License](https://img.shields.io/github/license/ibotty/smtp-s3-dump)](LICENSE)
+
 This is a SMTP server meant to be deployed behind a real MTA (postfix) to accept mail for programmatic consumption.
 It explodes mail to S3 with metadata, attachments (mime parts).
 
