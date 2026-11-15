@@ -46,6 +46,105 @@ jobs:
     - name: Test
       run: cargo test --locked --workspace --all-features
 
+  image:
+    name: Build and smoke-test image
+    if: ${{ github.event_name != 'schedule' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: registry.access.redhat.com/hi/postgresql:18
+        env:
+          POSTGRES_PASSWORD: smoke
+        ports:
+        - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -h 127.0.0.1"
+          --health-interval 2s
+          --health-retries 30
+      minio:
+        image: quay.io/hummingbird-community/minio:latest
+        command: server /data
+        env:
+          MINIO_ROOT_USER: smoke
+          MINIO_ROOT_PASSWORD: smokesmoke
+        ports:
+        - 9000:9000
+    env:
+      PGHOST: 127.0.0.1
+      PGUSER: postgres
+      PGPASSWORD: smoke
+      AWS_ENDPOINT_URL: http://127.0.0.1:9000
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: smoke
+      AWS_SECRET_ACCESS_KEY: smokesmoke
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: false
+    - run: |
+        rustup toolchain install stable --profile minimal \
+          -t x86_64-unknown-linux-musl --no-self-update
+        rustup default stable
+    - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+    - run: sudo apt-get install -y musl-tools swaks
+
+    - name: Build binary
+      run: cargo build --locked --release --all-features
+
+    - name: Build image
+      run: podman build --build-arg VERSION=smoke -t smtp-s3-dump:smoke .
+
+    - name: Prepare database
+      run: |
+        psql -v ON_ERROR_STOP=1 <<'SQL'
+        CREATE SCHEMA data_gateways;
+        CREATE TABLE data_gateways.smtp_gateway (
+          message_id text,
+          "to" text,
+          "from" text,
+          body_text text,
+          body_html text,
+          headers jsonb,
+          attachments jsonb
+        );
+        SQL
+
+    - name: Prepare bucket
+      run: timeout 60 bash -c 'until aws s3 mb s3://smoke; do sleep 1; done'
+
+    - name: Start image
+      run: |
+        install -D -m 644 -t /tmp/certs tests/fixtures/a.crt tests/fixtures/a.key
+        podman run -d --name app --network host -v /tmp/certs:/certs:ro \
+          -e SMTP_DOMAIN=a.example.org -e BUCKET_NAME=smoke \
+          -e SMTP_CERT_FILE=/certs/a.crt -e SMTP_KEY_FILE=/certs/a.key \
+          -e DATABASE_URL=postgres://postgres:smoke@127.0.0.1/postgres \
+          -e AWS_ENDPOINT_URL -e AWS_REGION -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY \
+          smtp-s3-dump:smoke
+        timeout 30 bash -c 'until (exec 3<>/dev/tcp/127.0.0.1/2525) 2>/dev/null; do sleep 0.5; done'
+
+    - name: Deliver mail
+      run: |
+        swaks --server 127.0.0.1 --port 2525 --tls \
+          --from sender@example.org --to rcpt@a.example.org --body 'smoke test' \
+          --attach-name smoke.txt --attach-type text/plain --attach 'attachment'
+
+    - name: Check database row
+      run: test "$(psql -At -c 'SELECT count(*) FROM data_gateways.smtp_gateway')" = 1
+
+    - name: Check bucket objects
+      run: |
+        keys=$(aws s3 ls --recursive s3://smoke)
+        echo "$keys"
+        grep -q '/headers\.json$' <<<"$keys"
+        grep -q '/body\.txt$' <<<"$keys"
+        grep -q '/attachments/00-smoke\.txt$' <<<"$keys"
+
+    - name: Image logs
+      if: ${{ failure() }}
+      run: podman logs app
+
   audit:
     name: Cargo audit
     runs-on: ubuntu-24.04
