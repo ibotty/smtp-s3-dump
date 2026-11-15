@@ -1,4 +1,4 @@
-FROM registry.access.redhat.com/ubi10-minimal@sha256:a9f9316ec3a1419a2de6ce4d2d9f034d477e97cdf2a16d6f04b7bd632ac753c4
+FROM registry.access.redhat.com/hi/static:latest
 ARG BINARY=target/x86_64-unknown-linux-musl/release/smtp-s3-dump
 ARG VERSION
 
@@ -14,5 +14,4 @@ EXPOSE 2525/tcp 2526/tcp
 
 COPY $BINARY /smtp-s3-dump
 
-USER 1000
 CMD ["/smtp-s3-dump"]
