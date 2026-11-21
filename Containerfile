@@ -1,4 +1,4 @@
-FROM registry.access.redhat.com/hi/static:latest
+FROM registry.access.redhat.com/hi/static:latest@sha256:cac22d5a26d90c14801f8e48cc99dcb8a08f270cdc9ebaa205ac5b29f8a3d2fa
 ARG BINARY=target/x86_64-unknown-linux-musl/release/smtp-s3-dump
 ARG VERSION
 
